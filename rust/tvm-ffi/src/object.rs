@@ -20,9 +20,10 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU64;
 
 use crate::derive::ObjectRef;
+use crate::type_traits::AnyCompatible;
 pub use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 /// Object related ABI handling
-use tvm_ffi_sys::{TVMFFIGetCustomAllocator, TVMFFIObject, COMBINED_REF_COUNT_BOTH_ONE};
+use tvm_ffi_sys::{TVMFFIAny, TVMFFIGetCustomAllocator, TVMFFIObject, COMBINED_REF_COUNT_BOTH_ONE};
 
 /// Object type is by default the TVMFFIObject
 #[repr(C)]
@@ -92,14 +93,65 @@ pub unsafe trait ObjectCoreWithExtraItems: ObjectCore {
 
 /// Traits to specify core operations of ObjectRef
 ///
-/// used by the ffi Any system and not user facing
+/// Used by the FFI Any system and object-reference conversions.
 ///
 /// We mark as unsafe since it moves out the internal of the ObjectRef
+///
+/// # Safety
+///
+/// `data` and `into_data` must refer to the same live allocation. Its leading
+/// `TVMFFIObject` header must contain a registered object-range runtime type
+/// index that accurately describes an allocation compatible with
+/// `ContainerType`.
 pub unsafe trait ObjectRefCore: Sized + Clone {
     type ContainerType: ObjectCore;
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType>;
     fn into_data(this: Self) -> ObjectArc<Self::ContainerType>;
     fn from_data(data: ObjectArc<Self::ContainerType>) -> Self;
+
+    /// Try to cast this object reference to another object-reference type.
+    ///
+    /// The target's [`AnyCompatible::check_any_strict`] implementation defines
+    /// compatibility. A successful cast reuses the same object allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target rejects the value. This method consumes
+    /// and drops `self` on failure; clone it first if the source must be kept.
+    #[inline(always)]
+    fn try_cast<T>(self) -> crate::Result<T>
+    where
+        T: ObjectRefCore + AnyCompatible,
+    {
+        let source = Self::into_data(self);
+        let mut any_data = TVMFFIAny::new();
+
+        unsafe {
+            let source_ptr = ObjectArc::as_raw(&source) as *const TVMFFIObject;
+            any_data.type_index = (*source_ptr).type_index;
+            debug_assert!(any_data.type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32);
+            // SAFETY: ObjectRefCore requires a valid object-range type index.
+            // Exposing the invariant lets the temporary TVMFFIAny optimize away.
+            std::hint::assert_unchecked(
+                any_data.type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32,
+            );
+            any_data.small_str_len = 0;
+            any_data.data_union.v_obj = source_ptr as *mut TVMFFIObject;
+
+            if T::check_any_strict(&any_data) {
+                let owned_ptr = ObjectArc::into_raw(source);
+                any_data.data_union.v_obj = owned_ptr as *mut TVMFFIObject;
+                Ok(T::move_from_any_after_check(&mut any_data))
+            } else {
+                let msg = format!(
+                    "Cannot convert from type `{}` to `{}`",
+                    T::get_mismatch_type_info(&any_data),
+                    T::type_str()
+                );
+                Err(crate::error::Error::new(crate::error::TYPE_ERROR, &msg, ""))
+            }
+        }
+    }
 }
 
 /// Base class for ObjectRef
