@@ -31,6 +31,7 @@ use tvm_ffi_sys::{TVMFFIAny, TVMFFIObject};
 #[derive(Object)]
 #[type_key = "ffi.Array"]
 #[type_index(TypeIndex::kTVMFFIArray)]
+#[type_final]
 pub struct ArrayObj {
     pub object: Object,
     /// Pointer to the start of the element buffer (AddressOf(0)).

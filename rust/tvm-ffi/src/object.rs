@@ -50,6 +50,12 @@ unsafe impl<T: Send + Sync + ObjectCore> Sync for ObjectArc<T> {}
 pub unsafe trait ObjectCore: Sized + 'static {
     /// the type key of the object
     const TYPE_KEY: &'static str;
+    /// Whether this object type can have registered subtypes.
+    ///
+    /// Setting this to `true` promises that no object with a different runtime
+    /// type index can be an instance of this type.
+    #[doc(hidden)]
+    const TYPE_FINAL: bool = false;
     // return the type index of the object
     fn type_index() -> i32;
     /// Return the object header
@@ -97,6 +103,13 @@ pub unsafe trait ObjectCoreWithExtraItems: ObjectCore {
 /// We mark as unsafe since it moves out the internal of the ObjectRef
 pub unsafe trait ObjectRefCore: Sized + Clone {
     type ContainerType: ObjectCore;
+    /// Whether this reference's `AnyView` compatibility is determined only by
+    /// the runtime type index associated with `ContainerType`.
+    ///
+    /// Together with `ContainerType::TYPE_FINAL`, this promises that conversion
+    /// accepts exactly one runtime type index and has no value-dependent checks.
+    #[doc(hidden)]
+    const TYPE_CONTAINER_IS_EXACT: bool = false;
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType>;
     fn into_data(this: Self) -> ObjectArc<Self::ContainerType>;
     fn from_data(data: ObjectArc<Self::ContainerType>) -> Self;

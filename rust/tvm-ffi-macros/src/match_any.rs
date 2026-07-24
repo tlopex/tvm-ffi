@@ -24,6 +24,8 @@ use syn::{braced, parenthesized, Expr, Pat, Path, Result, Token};
 
 use crate::utils::get_tvm_ffi_crate;
 
+const MIN_INDEXED_ARMS: usize = 4;
+
 struct MatchAnyInput {
     scrutinee: Expr,
     arms: Vec<TypedArm>,
@@ -105,23 +107,41 @@ pub fn expand(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
 fn expand_match_any(input: MatchAnyInput) -> TokenStream {
     let tvm_ffi = get_tvm_ffi_crate();
+    let scrutinee = input.scrutinee;
+    let fallback = input.fallback;
+    let arms = input.arms;
+    let can_use_exact_dispatch = arms.len() >= MIN_INDEXED_ARMS
+        && arms
+            .iter()
+            .all(|arm| arm.guard.is_none() && is_simple_binding(&arm.binding));
+
+    if !can_use_exact_dispatch {
+        return expand_ordered_match(&tvm_ffi, &scrutinee, &arms, &fallback);
+    }
+
+    expand_indexed_match(&tvm_ffi, &scrutinee, &arms, &fallback)
+}
+
+fn expand_ordered_match(
+    tvm_ffi: &TokenStream,
+    scrutinee: &Expr,
+    arms: &[TypedArm],
+    fallback: &Expr,
+) -> TokenStream {
     let span = Span::mixed_site();
     let source = Ident::new("__tvm_ffi_match_any_source", span);
     let converted = Ident::new("__tvm_ffi_match_any_converted", span);
     let view = Ident::new("__tvm_ffi_match_any_view", span);
     let rejected = Ident::new("__tvm_ffi_match_any_rejected", span);
-    let scrutinee = input.scrutinee;
-    let fallback = input.fallback;
     let dispatch_fallback = fallback.clone();
-    let arms = input.arms;
     let dispatch = arms
-        .into_iter()
+        .iter()
         .rev()
         .fold(quote!({ #dispatch_fallback }), |next, arm| {
-            let matcher = arm.matcher;
-            let binding = arm.binding;
-            let body = arm.body;
-            let matched = if let Some(guard) = arm.guard {
+            let matcher = &arm.matcher;
+            let binding = &arm.binding;
+            let body = &arm.body;
+            let matched = if let Some(guard) = &arm.guard {
                 quote!(::core::result::Result::Ok(#binding) if #guard)
             } else {
                 quote!(::core::result::Result::Ok(#binding))
@@ -157,5 +177,195 @@ fn expand_match_any(input: MatchAnyInput) -> TokenStream {
                 #fallback
             }
         }
+    }
+}
+
+fn expand_indexed_match(
+    tvm_ffi: &TokenStream,
+    scrutinee: &Expr,
+    arms: &[TypedArm],
+    fallback: &Expr,
+) -> TokenStream {
+    let span = Span::mixed_site();
+    let source = Ident::new("__tvm_ffi_match_any_source", span);
+    let converted = Ident::new("__tvm_ffi_match_any_converted", span);
+    let view = Ident::new("__tvm_ffi_match_any_view", span);
+    let is_object = Ident::new("__tvm_ffi_match_any_is_object", span);
+    let rejected = Ident::new("__tvm_ffi_match_any_rejected", span);
+    let probe = Ident::new("__tvm_ffi_match_any_probe", span);
+    let pattern_types = Ident::new("__tvm_ffi_match_any_pattern_types", span);
+    let plan = Ident::new("__TVM_FFI_MATCH_ANY_PLAN", span);
+    let selected_arm = Ident::new("__tvm_ffi_match_any_selected_arm", span);
+    let arm_id = Ident::new("__tvm_ffi_match_any_arm_id", span);
+    let matched = Ident::new("__tvm_ffi_match_any_matched", span);
+    let matched_value = Ident::new("__tvm_ffi_match_any_matched_value", span);
+    let matched_enum = Ident::new("__TvmFfiMatchAnyArm", span);
+    let arm_count = arms.len();
+    let matchers = arms.iter().map(|arm| &arm.matcher).collect::<Vec<_>>();
+    let arm_types = (0..arm_count)
+        .map(|arm_id| Ident::new(&format!("__TvmFfiMatchAnyType{arm_id}"), span))
+        .collect::<Vec<_>>();
+    let arm_variants = (0..arm_count)
+        .map(|arm_id| Ident::new(&format!("Arm{arm_id}"), span))
+        .collect::<Vec<_>>();
+
+    let pattern_list = matchers
+        .iter()
+        .rev()
+        .fold(quote!(()), |tail, matcher| quote!((#matcher, #tail)));
+    let select_arm = quote! {
+        {
+            use #tvm_ffi::match_any::{
+                DynamicPatternListProbe as _,
+                ExactPatternListProbe as _,
+            };
+
+            let #probe =
+                #tvm_ffi::match_any::PatternListProbe::<#pattern_list>::new();
+            match (&#probe).pattern_types() {
+                ::core::option::Option::Some(#pattern_types) => {
+                    static #plan: ::std::sync::OnceLock<
+                        #tvm_ffi::match_any::ExactDispatchPlan,
+                    > = ::std::sync::OnceLock::new();
+                    let plan = #plan.get_or_init(|| {
+                        let mut type_indices = [
+                            ::core::option::Option::None;
+                            #arm_count
+                        ];
+                        (&#probe).fill_type_indices(&mut type_indices);
+                        #tvm_ffi::match_any::ExactDispatchPlan::build(
+                            #pattern_types,
+                            &type_indices,
+                        )
+                    });
+                    plan.lookup(#pattern_types, #view.type_index())
+                }
+                ::core::option::Option::None => {
+                    ::core::result::Result::Err(())
+                }
+            }
+        }
+    };
+
+    let ordered_selection = arms.iter().enumerate().rev().fold(
+        quote!(::core::option::Option::None),
+        |next, (arm_id, arm)| {
+            let matcher = &arm.matcher;
+            let variant = &arm_variants[arm_id];
+
+            quote! {
+                match ::core::convert::TryInto::<#matcher>::try_into(#view) {
+                    ::core::result::Result::Ok(#matched_value) => {
+                        ::core::option::Option::Some(
+                            #matched_enum::#variant(#matched_value)
+                        )
+                    }
+                    #rejected => {
+                        ::core::mem::drop(#rejected);
+                        #next
+                    },
+                }
+            }
+        },
+    );
+
+    let direct_selection = arms.iter().enumerate().map(|(arm_id, arm)| {
+        let matcher = &arm.matcher;
+        let variant = &arm_variants[arm_id];
+
+        quote! {
+            #arm_id => {
+                match ::core::convert::TryInto::<#matcher>::try_into(#view) {
+                    ::core::result::Result::Ok(#matched_value) => {
+                        ::core::option::Option::Some(
+                            #matched_enum::#variant(#matched_value)
+                        )
+                    }
+                    #rejected => {
+                        ::core::mem::drop(#rejected);
+                        ::core::panic!(
+                            "match_any! exact TypeIndex selected an incompatible arm"
+                        )
+                    },
+                }
+            }
+        }
+    });
+
+    let body_dispatch = arms.iter().enumerate().map(|(arm_id, arm)| {
+        let binding = &arm.binding;
+        let body = &arm.body;
+        let variant = &arm_variants[arm_id];
+
+        quote! {
+            ::core::option::Option::Some(
+                #matched_enum::#variant(#binding)
+            ) => {
+                #body
+            }
+        }
+    });
+
+    quote! {
+        {
+            enum #matched_enum<#(#arm_types),*> {
+                #(#arm_variants(#arm_types),)*
+            }
+
+            let #source = &(#scrutinee);
+            let #converted: ::core::result::Result<
+                #tvm_ffi::AnyView<'_>,
+                ::core::convert::Infallible,
+            > = ::core::convert::TryInto::<#tvm_ffi::AnyView<'_>>::try_into(#source);
+            let #view = match #converted {
+                ::core::result::Result::Ok(view) => view,
+                ::core::result::Result::Err(error) => match error {},
+            };
+            let #is_object = #view.type_index()
+                >= #tvm_ffi::TypeIndex::kTVMFFIStaticObjectBegin as i32;
+            #[allow(unused_mut)]
+            let mut #matched: ::core::option::Option<
+                #matched_enum<#(#matchers),*>
+            > = if #is_object {
+                let #selected_arm: ::core::result::Result<
+                    ::core::option::Option<usize>,
+                    (),
+                > = #select_arm;
+                match #selected_arm {
+                    ::core::result::Result::Ok(
+                        ::core::option::Option::Some(#arm_id),
+                    ) => {
+                        match #arm_id {
+                            #(#direct_selection,)*
+                            _ => ::core::unreachable!(),
+                        }
+                    }
+                    ::core::result::Result::Ok(
+                        ::core::option::Option::None,
+                    ) => {
+                        ::core::option::Option::None
+                    }
+                    ::core::result::Result::Err(()) => {
+                        #ordered_selection
+                    }
+                }
+            } else {
+                ::core::option::Option::None
+            };
+            match #matched {
+                #(#body_dispatch,)*
+                ::core::option::Option::None => {
+                    #fallback
+                }
+            }
+        }
+    }
+}
+
+fn is_simple_binding(binding: &Pat) -> bool {
+    match binding {
+        Pat::Ident(binding) => binding.subpat.is_none(),
+        Pat::Wild(_) => true,
+        _ => false,
     }
 }

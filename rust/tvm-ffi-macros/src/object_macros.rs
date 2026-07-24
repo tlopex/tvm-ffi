@@ -31,6 +31,11 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
     let type_key = get_attr(&derive_input, "type_key")
         .map(attr_to_str)
         .expect("Expect #[type_key = \"<my_type_key>\"] attribute");
+    let type_final = match get_attr(&derive_input, "type_final") {
+        Some(attr) if matches!(attr.parse_meta(), Ok(syn::Meta::Path(_))) => true,
+        Some(_) => panic!("Expect #[type_final] attribute"),
+        None => false,
+    };
 
     // type index can be optional
     // for now we make it required for static index
@@ -93,6 +98,7 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
     let expanded = quote! {
         unsafe impl #tvm_ffi_crate::object::ObjectCore for #struct_name {
             const TYPE_KEY: &'static str = #type_key;
+            const TYPE_FINAL: bool = #type_final;
 
             #type_index_tokens
 
@@ -127,6 +133,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
     let mut expanded = quote! {
         unsafe impl #tvm_ffi_crate::object::ObjectRefCore for #struct_name {
             type ContainerType = <#data_ty as std::ops::Deref>::Target;
+            const TYPE_CONTAINER_IS_EXACT: bool = true;
             #[inline]
             fn data(this: &Self) -> &ObjectArc<Self::ContainerType> {
                 &this.data

@@ -31,6 +31,7 @@ use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 #[derive(Object)]
 #[type_key = "ffi.Module"]
 #[type_index(TypeIndex::kTVMFFIModule)]
+#[type_final]
 pub struct ModuleObj {
     object: Object,
 }
@@ -69,5 +70,78 @@ impl Module {
         crate::cached_global_func!("ffi.ModuleGetFunction")
             .call_tuple_with_len::<3, _>((self, name, true))?
             .try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::collections::array::ArrayObj;
+    use crate::collections::map::MapObj;
+    use crate::string::{BytesObj, StringObj};
+    use crate::{match_any, Any, AnyCompatible, AnyView, Array, ObjectRefCore, Tensor};
+
+    // Test-only object handles for distinct final built-in container types.
+    #[repr(C)]
+    #[derive(ObjectRef, Clone)]
+    struct RawArray {
+        data: ObjectArc<ArrayObj>,
+    }
+
+    #[repr(C)]
+    #[derive(ObjectRef, Clone)]
+    struct RawMap {
+        data: ObjectArc<MapObj>,
+    }
+
+    #[repr(C)]
+    #[derive(ObjectRef, Clone)]
+    struct RawBytes {
+        data: ObjectArc<BytesObj>,
+    }
+
+    #[repr(C)]
+    #[derive(ObjectRef, Clone)]
+    struct RawString {
+        data: ObjectArc<StringObj>,
+    }
+
+    #[test]
+    fn match_any_preserves_arm_body_across_generic_dispatch_paths() {
+        fn classify<T>(value: Any) -> usize
+        where
+            T: AnyCompatible + ObjectRefCore + 'static,
+            for<'a> T: TryFrom<AnyView<'a>>,
+        {
+            match_any! {
+                value {
+                    T(ref mut object) => {
+                        let _ = object;
+                        static CALLS: AtomicUsize = AtomicUsize::new(0);
+                        return CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+                    },
+                    RawMap(_) => (),
+                    RawBytes(_) => (),
+                    RawString(_) => (),
+                    _ => (),
+                }
+            }
+            0
+        }
+
+        let module = Module {
+            data: ObjectArc::new(ModuleObj {
+                object: Object::new(),
+            }),
+        };
+        assert_eq!(classify::<Module>(Any::from(module)), 1);
+
+        let tensor = Tensor::from_slice(&[0_f32; 1], &[1]).unwrap();
+        assert_eq!(classify::<Module>(Any::from(tensor)), 0);
+
+        let array = [1_i64, 2].into_iter().collect::<Array<i64>>();
+        assert_eq!(classify::<RawArray>(Any::from(array)), 2);
     }
 }

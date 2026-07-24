@@ -40,6 +40,7 @@ pub struct Bytes {
 #[derive(Object)]
 #[type_key = "ffi.Bytes"]
 #[type_index(TypeIndex::kTVMFFIBytes)]
+#[type_final]
 pub(crate) struct BytesObj {
     object: Object,
     data: TVMFFIByteArray,
@@ -233,6 +234,7 @@ pub struct String {
 #[derive(Object)]
 #[type_key = "ffi.String"]
 #[type_index(TypeIndex::kTVMFFIStr)]
+#[type_final]
 pub(crate) struct StringObj {
     object: Object,
     data: TVMFFIByteArray,
