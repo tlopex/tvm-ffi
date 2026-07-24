@@ -57,6 +57,7 @@ use tvm_ffi_sys::{TVMFFIAny, TVMFFIObject};
 #[derive(Object)]
 #[type_key = "ffi.Map"]
 #[type_index(TypeIndex::kTVMFFIMap)]
+#[type_final]
 pub struct MapObj {
     pub object: Object,
     /// Pointer to the (opaque) key/value storage region (`MapBaseObj::data_`).
