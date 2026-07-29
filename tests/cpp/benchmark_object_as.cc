@@ -27,7 +27,6 @@
 #include <iostream>
 #include <limits>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -61,20 +60,10 @@ using Runner = std::size_t (*)(const ObjectRef&, std::uint64_t);
 
 template <typename T>
 inline void DoNotOptimize(const T& value) {
-#if defined(__GNUC__) || defined(__clang__)
   asm volatile("" : : "g"(&value) : "memory");
-#else
-  (void)value;
-#endif
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-#define TVM_FFI_BENCH_NOINLINE __attribute__((noinline))
-#else
-#define TVM_FFI_BENCH_NOINLINE
-#endif
-
-TVM_FFI_BENCH_NOINLINE std::size_t Noop(const ObjectRef& input, std::uint64_t iterations) {
+TVM_FFI_NO_INLINE std::size_t Noop(const ObjectRef& input, std::uint64_t iterations) {
   std::size_t checksum = 0;
   for (std::uint64_t i = 0; i < iterations; ++i) {
     DoNotOptimize(input);
@@ -86,7 +75,7 @@ TVM_FFI_BENCH_NOINLINE std::size_t Noop(const ObjectRef& input, std::uint64_t it
   return checksum;
 }
 
-TVM_FFI_BENCH_NOINLINE std::size_t SingleAs(const ObjectRef& input, std::uint64_t iterations) {
+TVM_FFI_NO_INLINE std::size_t SingleAs(const ObjectRef& input, std::uint64_t iterations) {
   std::size_t checksum = 0;
   for (std::uint64_t i = 0; i < iterations; ++i) {
     DoNotOptimize(input);
@@ -98,8 +87,7 @@ TVM_FFI_BENCH_NOINLINE std::size_t SingleAs(const ObjectRef& input, std::uint64_
   return checksum;
 }
 
-TVM_FFI_BENCH_NOINLINE std::size_t TwoItemAsChain(const ObjectRef& input,
-                                                  std::uint64_t iterations) {
+TVM_FFI_NO_INLINE std::size_t TwoItemAsChain(const ObjectRef& input, std::uint64_t iterations) {
   std::size_t checksum = 0;
   for (std::uint64_t i = 0; i < iterations; ++i) {
     DoNotOptimize(input);

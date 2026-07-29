@@ -57,12 +57,6 @@ impl<'a> AnyView<'a> {
         self.data.type_index
     }
 
-    #[doc(hidden)]
-    #[inline(always)]
-    pub(crate) unsafe fn copy_after_check<T: AnyCompatible>(&self) -> T {
-        unsafe { T::copy_from_any_view_after_check(&self.data) }
-    }
-
     /// More strict version than try_from/try_into
     ///
     /// This function will not try to cast the type

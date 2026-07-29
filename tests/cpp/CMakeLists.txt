@@ -29,23 +29,18 @@ if (MSVC)
   target_link_options(tvm_ffi_tests PRIVATE /DEBUG)
 endif ()
 
-add_executable(tvm_ffi_object_as_benchmark EXCLUDE_FROM_ALL benchmark_object_as.cc)
-
-set_target_properties(
-  tvm_ffi_object_as_benchmark
-  PROPERTIES CXX_STANDARD 17
-             CXX_STANDARD_REQUIRED ON
-             CXX_EXTENSIONS OFF
-             ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-             LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-)
-
-tvm_ffi_add_cxx_warning(tvm_ffi_object_as_benchmark)
-tvm_ffi_add_msvc_flags(tvm_ffi_object_as_benchmark)
-if (MSVC)
-  target_compile_options(tvm_ffi_object_as_benchmark PRIVATE /O2)
-elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+  add_executable(tvm_ffi_object_as_benchmark EXCLUDE_FROM_ALL benchmark_object_as.cc)
+  set_target_properties(
+    tvm_ffi_object_as_benchmark
+    PROPERTIES CXX_STANDARD 17
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF
+               ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+               LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  )
+  tvm_ffi_add_cxx_warning(tvm_ffi_object_as_benchmark)
   target_compile_options(tvm_ffi_object_as_benchmark PRIVATE -O3)
+  target_link_libraries(tvm_ffi_object_as_benchmark PRIVATE tvm_ffi_shared)
 endif ()
-target_link_libraries(tvm_ffi_object_as_benchmark PRIVATE tvm_ffi_shared)
