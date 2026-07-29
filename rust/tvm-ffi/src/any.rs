@@ -22,11 +22,7 @@ use crate::type_traits::AnyCompatible;
 use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi_sys::{TVMFFIAny, TVMFFIAnyViewToOwnedAny};
 
-/// Unmanaged Any that can hold reference to values.
-///
-/// Standard `TryFrom<AnyView>` conversions report a mismatch as `()`, so
-/// speculative casts do not allocate a diagnostic error. Convert the view to
-/// an owned [`Any`] first when a detailed conversion error is required.
+/// Unmanaged Any that can hold reference to values
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct AnyView<'a> {
@@ -301,16 +297,24 @@ impl<'a, T: AnyCompatible> TryFrom<AnyView<'a>> for TryFromTemp<T> {
     type Error = crate::error::Error;
     #[inline]
     fn try_from(value: AnyView<'a>) -> Result<Self, Self::Error> {
-        try_cast_from_any_view::<T>(&value)
-            .map(TryFromTemp::new)
-            .map_err(|()| {
-                let msg = format!(
-                    "Cannot convert from type `{}` to `{}`",
-                    T::get_mismatch_type_info(&value.data),
-                    T::type_str()
-                );
-                crate::error::Error::new(crate::error::TYPE_ERROR, &msg, "")
-            })
+        unsafe {
+            if T::check_any_strict(&value.data) {
+                Ok(TryFromTemp::new(T::copy_from_any_view_after_check(
+                    &value.data,
+                )))
+            } else {
+                T::try_cast_from_any_view(&value.data)
+                    .map_err(|_| {
+                        let msg = format!(
+                            "Cannot convert from type `{}` to `{}`",
+                            T::get_mismatch_type_info(&value.data),
+                            T::type_str()
+                        );
+                        crate::error::Error::new(crate::error::TYPE_ERROR, &msg, "")
+                    })
+                    .map(TryFromTemp::new)
+            }
+        }
     }
 }
 

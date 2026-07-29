@@ -55,6 +55,16 @@ impl TestIntPair {
     }
 }
 
+struct CustomModuleMatcher;
+
+impl<'a> TryFrom<AnyView<'a>> for CustomModuleMatcher {
+    type Error = &'static str;
+
+    fn try_from(value: AnyView<'a>) -> Result<Self, Self::Error> {
+        value.try_as::<Module>().map(|_| Self).ok_or("not a Module")
+    }
+}
+
 #[test]
 fn matches_concrete_object_containers_in_source_order() {
     fn classify(expr: Any) -> (&'static str, usize) {
@@ -97,6 +107,27 @@ fn matches_concrete_object_containers_in_source_order() {
 }
 
 #[test]
+fn custom_try_into_matcher_keeps_ordered_compatibility() {
+    fn matches(value: AnyView<'_>) -> bool {
+        match_any! {
+            value {
+                CustomModuleMatcher(_) => true,
+                _ => false,
+            }
+        }
+    }
+
+    let module: Module = Function::get_global("ffi.SystemLib")
+        .unwrap()
+        .call_tuple_with_len::<0, _>(())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(matches(AnyView::from(&module)));
+    assert!(!matches(AnyView::from(&Shape::from([1_i64, 2]))));
+}
+
+#[test]
 fn parameterized_containers_keep_ordered_conversion() {
     let array = [1.5_f64, 2.5].into_iter().collect::<Array<f64>>();
     let selected = match_any! {
@@ -110,6 +141,77 @@ fn parameterized_containers_keep_ordered_conversion() {
     };
 
     assert_eq!(selected, "float array");
+}
+
+#[test]
+fn large_guarded_and_non_leaf_matches_keep_ordered_dispatch() {
+    // A guard disables the lookup expansion even at the 20-arm threshold.
+    fn guarded(view: AnyView<'_>) -> usize {
+        match_any! {
+            view {
+                Module(_) if false => 0,
+                Module(_) => 1,
+                Module(_) => 2,
+                Module(_) => 3,
+                Module(_) => 4,
+                Module(_) => 5,
+                Module(_) => 6,
+                Module(_) => 7,
+                Module(_) => 8,
+                Module(_) => 9,
+                Module(_) => 10,
+                Module(_) => 11,
+                Module(_) => 12,
+                Module(_) => 13,
+                Module(_) => 14,
+                Module(_) => 15,
+                Module(_) => 16,
+                Module(_) => 17,
+                Module(_) => 18,
+                Module(_) => 19,
+                _ => 20,
+            }
+        }
+    }
+
+    // A non-leaf pattern rejects the lookup metadata and uses the ordered fallback.
+    fn non_leaf(value: Any) -> usize {
+        match_any! {
+            value {
+                Array::<i64>(_) => 0,
+                Module(_) => 1,
+                Module(_) => 2,
+                Module(_) => 3,
+                Module(_) => 4,
+                Module(_) => 5,
+                Module(_) => 6,
+                Module(_) => 7,
+                Module(_) => 8,
+                Module(_) => 9,
+                Module(_) => 10,
+                Module(_) => 11,
+                Module(_) => 12,
+                Module(_) => 13,
+                Module(_) => 14,
+                Module(_) => 15,
+                Module(_) => 16,
+                Module(_) => 17,
+                Module(_) => 18,
+                Module(_) => 19,
+                _ => 20,
+            }
+        }
+    }
+
+    let module: Module = Function::get_global("ffi.SystemLib")
+        .unwrap()
+        .call_tuple_with_len::<0, _>(())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(guarded(AnyView::from(&module)), 1);
+    assert_eq!(non_leaf(Any::from(module)), 1);
+    assert_eq!(non_leaf(Any::from(Array::<i64>::default())), 0);
 }
 
 #[test]

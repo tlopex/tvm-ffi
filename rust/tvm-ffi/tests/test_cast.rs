@@ -196,8 +196,8 @@ fn test_any_conversion_preserves_runtime_subtype() {
 
     let delete_counter = Arc::new(AtomicU32::new(0));
     let base = new_base(1, delete_counter.clone());
-    let result: std::result::Result<TestDerived, ()> = AnyView::from(&base).try_into();
-    assert!(matches!(result, Err(())));
+    let result: Result<TestDerived> = AnyView::from(&base).try_into();
+    assert!(result.is_err());
     drop(base);
     assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
 }

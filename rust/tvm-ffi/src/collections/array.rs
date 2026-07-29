@@ -332,9 +332,10 @@ impl<'a, T> TryFrom<AnyView<'a>> for Array<T>
 where
     T: AnyCompatible + Clone + 'static,
 {
-    type Error = ();
+    type Error = crate::error::Error;
 
     fn try_from(value: AnyView<'a>) -> Result<Self, Self::Error> {
-        crate::any::try_cast_from_any_view::<Self>(&value)
+        let temp: TryFromTemp<Self> = TryFromTemp::try_from(value)?;
+        Ok(TryFromTemp::into_value(temp))
     }
 }

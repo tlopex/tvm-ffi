@@ -519,9 +519,10 @@ where
     K: AnyCompatible,
     V: AnyCompatible,
 {
-    type Error = ();
+    type Error = Error;
 
-    fn try_from(value: AnyView<'a>) -> Result<Self, Self::Error> {
-        crate::any::try_cast_from_any_view::<Self>(&value)
+    fn try_from(value: AnyView<'a>) -> Result<Self> {
+        let temp: TryFromTemp<Self> = TryFromTemp::try_from(value)?;
+        Ok(TryFromTemp::into_value(temp))
     }
 }

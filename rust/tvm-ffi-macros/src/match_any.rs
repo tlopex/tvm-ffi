@@ -136,7 +136,7 @@ fn expand_ordered_match(
     let converted = Ident::new("__tvm_ffi_match_any_converted", span);
     let view = Ident::new("__tvm_ffi_match_any_view", span);
     let rejected = Ident::new("__tvm_ffi_match_any_rejected", span);
-    let dispatch = expand_ordered_dispatch(arms, fallback, &view, &rejected);
+    let dispatch = expand_ordered_dispatch(tvm_ffi, arms, fallback, &view, &rejected);
 
     quote! {
         {
@@ -161,23 +161,32 @@ fn expand_ordered_match(
 }
 
 fn expand_ordered_dispatch(
+    tvm_ffi: &TokenStream,
     arms: &[TypedArm],
     fallback: &Expr,
     view: &Ident,
     rejected: &Ident,
 ) -> TokenStream {
-    expand_ordered_try_into_chain(arms, quote!({ #fallback }), view, rejected, |_, arm| {
-        let binding = &arm.binding;
-        let body = &arm.body;
-        if let Some(guard) = &arm.guard {
-            quote!(::core::result::Result::Ok(#binding) if #guard => { #body })
-        } else {
-            quote!(::core::result::Result::Ok(#binding) => { #body })
-        }
-    })
+    expand_ordered_try_into_chain(
+        tvm_ffi,
+        arms,
+        quote!({ #fallback }),
+        view,
+        rejected,
+        |_, arm| {
+            let binding = &arm.binding;
+            let body = &arm.body;
+            if let Some(guard) = &arm.guard {
+                quote!(::core::result::Result::Ok(#binding) if #guard => { #body })
+            } else {
+                quote!(::core::result::Result::Ok(#binding) => { #body })
+            }
+        },
+    )
 }
 
 fn expand_ordered_try_into_chain<F>(
+    tvm_ffi: &TokenStream,
     arms: &[TypedArm],
     fallback: TokenStream,
     view: &Ident,
@@ -193,9 +202,10 @@ where
         .fold(fallback, |next, (arm_id, arm)| {
             let matcher = &arm.matcher;
             let matched = matched_arm(arm_id, arm);
+            let conversion = expand_pattern_conversion(tvm_ffi, matcher, view);
 
             quote! {
-                match ::core::convert::TryInto::<#matcher>::try_into(#view) {
+                match #conversion {
                     #matched,
                     #rejected => {
                         ::core::mem::drop(#rejected);
@@ -204,6 +214,24 @@ where
                 }
             }
         })
+}
+
+fn expand_pattern_conversion(tvm_ffi: &TokenStream, matcher: &Path, view: &Ident) -> TokenStream {
+    let span = Span::mixed_site();
+    let probe = Ident::new("__tvm_ffi_match_any_conversion_probe", span);
+    let converted = Ident::new("__tvm_ffi_match_any_pattern_conversion", span);
+
+    quote! {
+        {
+            use #tvm_ffi::match_any_internal::PatternConversion as _;
+
+            let #probe =
+                #tvm_ffi::match_any_internal::PatternConversionProbe::<#matcher>::new();
+            let #converted: ::core::result::Result<#matcher, ()> =
+                (&#probe).try_convert(#view);
+            #converted
+        }
+    }
 }
 
 fn expand_leaf_table_lookup(tvm_ffi: &TokenStream, arms: &[TypedArm], view: &Ident) -> TokenStream {
@@ -250,6 +278,7 @@ fn expand_leaf_table_lookup(tvm_ffi: &TokenStream, arms: &[TypedArm], view: &Ide
 }
 
 fn expand_direct_leaf_selection(
+    tvm_ffi: &TokenStream,
     arms: &[TypedArm],
     arm_constants: &[Ident],
     arm_variants: &[Ident],
@@ -263,10 +292,11 @@ fn expand_direct_leaf_selection(
         let matcher = &arm.matcher;
         let variant = &arm_variants[arm_id];
         let arm_constant = &arm_constants[arm_id];
+        let conversion = expand_pattern_conversion(tvm_ffi, matcher, view);
 
         quote! {
             #arm_constant => {
-                match ::core::convert::TryInto::<#matcher>::try_into(#view) {
+                match #conversion {
                     ::core::result::Result::Ok(#selected_value) => {
                         #selected_enum::#variant(#selected_value)
                     }
@@ -357,6 +387,7 @@ fn expand_leaf_lookup_match(
             });
     let lookup_arm_id = expand_leaf_table_lookup(tvm_ffi, arms, &view);
     let ordered_selection = expand_ordered_try_into_chain(
+        tvm_ffi,
         arms,
         quote!(#selected_enum::#fallback_variant),
         &view,
@@ -372,6 +403,7 @@ fn expand_leaf_lookup_match(
     );
 
     let direct_selection = expand_direct_leaf_selection(
+        tvm_ffi,
         arms,
         &arm_constants,
         &arm_variants,

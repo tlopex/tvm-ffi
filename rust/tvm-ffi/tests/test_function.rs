@@ -44,8 +44,7 @@ fn test_function_from_packed() {
             "Expected 1 argument, got {}",
             args.len()
         );
-        let v0 = i32::try_from(args[0])
-            .map_err(|()| Error::new(TYPE_ERROR, "Expected an int argument", ""))?;
+        let v0 = i32::try_from(args[0])?;
         ensure!(v0 == value, VALUE_ERROR, "Expected {}, got {}", value, v0);
         Ok(Any::from(v0 + v2))
     });

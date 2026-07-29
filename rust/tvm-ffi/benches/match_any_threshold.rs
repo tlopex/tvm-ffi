@@ -160,9 +160,10 @@ fn noop(inputs: &[ObjectRef], rounds: u64) -> usize {
 }
 
 #[inline(never)]
-fn single_any_view_try_into(inputs: &[ObjectRef], rounds: u64) -> usize {
+fn single_lightweight_conversion(inputs: &[ObjectRef], rounds: u64) -> usize {
     run_hot_loop!(inputs, rounds, value => {
-        match TryInto::<Leaf0>::try_into(AnyView::from(value)) {
+        let view = AnyView::from(value);
+        match tvm_ffi::any::try_cast_from_any_view::<Leaf0>(&view) {
             Ok(_matched) => 0,
             Err(()) => MISS,
         }
@@ -170,11 +171,12 @@ fn single_any_view_try_into(inputs: &[ObjectRef], rounds: u64) -> usize {
 }
 
 #[inline(never)]
-fn two_item_any_view_try_into_chain(inputs: &[ObjectRef], rounds: u64) -> usize {
+fn two_item_lightweight_conversion_chain(inputs: &[ObjectRef], rounds: u64) -> usize {
     run_hot_loop!(inputs, rounds, value => {
-        match TryInto::<Leaf0>::try_into(AnyView::from(value)) {
+        let view = AnyView::from(value);
+        match tvm_ffi::any::try_cast_from_any_view::<Leaf0>(&view) {
             Ok(_matched) => 0,
-            Err(()) => match TryInto::<Leaf1>::try_into(AnyView::from(value)) {
+            Err(()) => match tvm_ffi::any::try_cast_from_any_view::<Leaf1>(&view) {
                 Ok(_matched) => 1,
                 Err(()) => MISS,
             },
@@ -445,16 +447,19 @@ fn print_case(arity: usize, case: &str, runners: &[(&str, Runner)], inputs: &[Ob
     }
 }
 
-fn benchmark_try_into(values: &[ObjectRef; 21], miss: &ObjectRef) {
-    println!("ObjectRef -> AnyView -> TryInto baseline");
+fn benchmark_lightweight_conversion(values: &[ObjectRef; 21], miss: &ObjectRef) {
+    println!("ObjectRef -> AnyView -> lightweight match conversion baseline");
     println!("case\tstrategy\tns/call\tMAD(ns)");
     let single = [
         ("noop", noop as Runner),
-        ("single", single_any_view_try_into as Runner),
+        ("single", single_lightweight_conversion as Runner),
     ];
     let chain = [
         ("noop", noop as Runner),
-        ("two-item-chain", two_item_any_view_try_into_chain as Runner),
+        (
+            "two-item-chain",
+            two_item_lightweight_conversion_chain as Runner,
+        ),
     ];
     let first = [values[0].clone()];
     let second = [values[1].clone()];
@@ -623,8 +628,9 @@ fn warm_cold_dependencies(values: &[ObjectRef; 21]) {
 
     macro_rules! warm_cast {
         ($matcher:ty, $index:expr) => {
+            let view = AnyView::from(&values[$index]);
             black_box(
-                TryInto::<$matcher>::try_into(AnyView::from(&values[$index]))
+                tvm_ffi::any::try_cast_from_any_view::<$matcher>(&view)
                     .expect("matching leaf conversion"),
             );
         };
@@ -763,6 +769,6 @@ fn main() {
     println!("seed: {seed:#x}");
     println!("objects and shuffled input sequences are constructed before timing");
     println!("results are median and MAD over {SAMPLE_COUNT} rotated samples\n");
-    benchmark_try_into(&values, &miss);
+    benchmark_lightweight_conversion(&values, &miss);
     benchmark_hot(&values, &miss, seed);
 }

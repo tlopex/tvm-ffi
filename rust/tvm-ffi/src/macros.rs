@@ -159,20 +159,19 @@ macro_rules! attach_context {
 // ----------------------------------------------------------------------------
 
 // implements try from any for all integer types
-/// Macro to implement `TryFrom<AnyView>` and `TryFrom<Any>` for a list of types.
-///
-/// Borrowed-view mismatches use `()`; owned conversions retain diagnostic errors.
+/// Macro to implement `TryFrom<AnyView>` and `TryFrom<Any>` for a list of types
 #[macro_export]
 macro_rules! impl_try_from_any {
     ($($t:ty),* $(,)?) => {
         $(
             impl<'a> TryFrom<$crate::any::AnyView<'a>> for $t {
-                type Error = ();
+                type Error = $crate::error::Error;
                 #[inline(always)]
                 fn try_from(
                     value: $crate::any::AnyView<'a>
                 ) -> Result<Self, Self::Error> {
-                    return $crate::any::try_cast_from_any_view::<$t>(&value);
+                    type TryFromTemp = $crate::any::TryFromTemp<$t>;
+                    return TryFromTemp::try_from(value).map(TryFromTemp::into_value);
                 }
             }
 
@@ -190,19 +189,18 @@ macro_rules! impl_try_from_any {
     };
 }
 
-/// Macro to implement `TryFrom<AnyView>` and `TryFrom<Any>` for generic types like `Option<T>`.
-///
-/// Borrowed-view mismatches use `()`; owned conversions retain diagnostic errors.
+/// Macro to implement `TryFrom<AnyView>` and `TryFrom<Any>` for generic types like `Option<T>`
 #[macro_export]
 macro_rules! impl_try_from_any_for_parametric {
     ($generic_type:ident<$param:ident>) => {
         impl<'a, $param: AnyCompatible> TryFrom<$crate::any::AnyView<'a>>
             for $generic_type<$param>
         {
-            type Error = ();
+            type Error = $crate::error::Error;
             #[inline(always)]
             fn try_from(value: $crate::any::AnyView<'a>) -> Result<Self, Self::Error> {
-                return $crate::any::try_cast_from_any_view::<$generic_type<$param>>(&value);
+                type TryFromTemp<T> = $crate::any::TryFromTemp<$generic_type<$param>>;
+                return TryFromTemp::<T>::try_from(value).map(TryFromTemp::<T>::into_value);
             }
         }
 
