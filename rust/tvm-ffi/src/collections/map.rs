@@ -492,9 +492,10 @@ where
         let src = Self::copy_from_any_view_after_check(data);
         let mut pairs = Vec::with_capacity(src.len());
         for (k, v) in src.try_raw_entries().map_err(|_| ())? {
-            let k = TryFromTemp::<K>::try_from(k).map_err(|_| ())?;
-            let v = TryFromTemp::<V>::try_from(v).map_err(|_| ())?;
-            pairs.push((TryFromTemp::into_value(k), TryFromTemp::into_value(v)));
+            pairs.push((
+                crate::any::try_cast_from_any::<K>(k)?,
+                crate::any::try_cast_from_any::<V>(v)?,
+            ));
         }
         Self::from_pairs(&pairs).map_err(|_| ())
     }
@@ -518,10 +519,9 @@ where
     K: AnyCompatible,
     V: AnyCompatible,
 {
-    type Error = Error;
+    type Error = ();
 
-    fn try_from(value: AnyView<'a>) -> Result<Self> {
-        let temp: TryFromTemp<Self> = TryFromTemp::try_from(value)?;
-        Ok(TryFromTemp::into_value(temp))
+    fn try_from(value: AnyView<'a>) -> Result<Self, Self::Error> {
+        crate::any::try_cast_from_any_view::<Self>(&value)
     }
 }

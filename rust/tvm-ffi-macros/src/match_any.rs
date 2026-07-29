@@ -24,9 +24,10 @@ use syn::{braced, parenthesized, Expr, Pat, Path, Result, Token};
 
 use crate::utils::get_tvm_ffi_crate;
 
-// Keep single-arm matches ordered. Release benchmarks of the standard ObjectRef
-// conversion path show that lookup pays off from two arms when a later arm or
-// the fallback is reached.
+// A warmed release benchmark found no stable lookup crossover through twelve
+// arms under a uniformly shuffled mix of every arm plus fallback. Keep the
+// optimization disabled until a representative workload supports a threshold.
+const ENABLE_LEAF_LOOKUP: bool = false;
 const MIN_LOOKUP_TABLE_ARMS: usize = 2;
 
 struct MatchAnyInput {
@@ -113,7 +114,8 @@ fn expand_match_any(input: MatchAnyInput) -> TokenStream {
     let scrutinee = input.scrutinee;
     let fallback = input.fallback;
     let arms = input.arms;
-    let can_attempt_leaf_lookup = arms.len() >= MIN_LOOKUP_TABLE_ARMS
+    let can_attempt_leaf_lookup = ENABLE_LEAF_LOOKUP
+        && arms.len() >= MIN_LOOKUP_TABLE_ARMS
         && arms
             .iter()
             .all(|arm| arm.guard.is_none() && is_simple_binding(&arm.binding));

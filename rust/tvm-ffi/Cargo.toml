@@ -41,3 +41,7 @@ example = []
 name = "load_library"
 path = "examples/load_library.rs"
 required-features = ["example"]
+
+[[bench]]
+name = "match_any_threshold"
+harness = false

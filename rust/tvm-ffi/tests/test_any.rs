@@ -109,6 +109,15 @@ fn test_type_mismatch_error() {
     let any = Any::from(42i32);
     let opt_try_as = any.try_as::<bool>();
     assert!(opt_try_as.is_none());
+
+    let value = 1.2_f32;
+    assert_eq!(i32::try_from(AnyView::from(&value)), Err(()));
+
+    let value = 1_i64;
+    let array: std::result::Result<Array<i64>, ()> = AnyView::from(&value).try_into();
+    let map: std::result::Result<Map<i64, i64>, ()> = AnyView::from(&value).try_into();
+    assert!(array.is_err());
+    assert!(map.is_err());
 }
 
 #[test]

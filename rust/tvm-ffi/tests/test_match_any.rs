@@ -22,6 +22,16 @@ use std::any::TypeId;
 use tvm_ffi::match_any_internal::{ArmId, LeafLookupTable, LeafPatternMetadata, LeafPatternProbe};
 use tvm_ffi::{match_any, Any, AnyView, Array, Function, Map, Module, Shape, Tensor, TypeIndex};
 
+struct DirectShapeMatcher(Shape);
+
+impl<'a> TryInto<DirectShapeMatcher> for AnyView<'a> {
+    type Error = ();
+
+    fn try_into(self) -> Result<DirectShapeMatcher, Self::Error> {
+        self.try_as::<Shape>().map(DirectShapeMatcher).ok_or(())
+    }
+}
+
 #[test]
 fn matches_concrete_object_containers_in_source_order() {
     fn classify(expr: Any) -> (&'static str, usize) {
@@ -65,6 +75,24 @@ fn matches_concrete_object_containers_in_source_order() {
 
 #[test]
 fn parameterized_containers_keep_ordered_conversion() {
+    let integer_array = [1_i64, 2].into_iter().collect::<Array<i64>>();
+    let converted = match_any! {
+        Any::from(integer_array) {
+            Array::<f64>(array) => array.iter().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        }
+    };
+    assert_eq!(converted, vec![1.0, 2.0]);
+
+    let integer_map = [(1_i64, 10_i64)].into_iter().collect::<Map<i64, i64>>();
+    let converted = match_any! {
+        Any::from(integer_map) {
+            Map::<f64, f64>(map) => map.get(&1.0).unwrap(),
+            _ => None,
+        }
+    };
+    assert_eq!(converted, Some(10.0));
+
     let array = [1.5_f64, 2.5].into_iter().collect::<Array<f64>>();
     let selected = match_any! {
         Any::from(array) {
@@ -80,7 +108,30 @@ fn parameterized_containers_keep_ordered_conversion() {
 }
 
 #[test]
-fn leaf_lookup_keeps_the_first_arm() {
+fn custom_try_into_matchers_keep_the_ordered_fallback() {
+    let selected = match_any! {
+        Any::from(Shape::from([2_i64, 3, 4])) {
+            DirectShapeMatcher(shape) => shape.0.len(),
+            Tensor(_) => 0,
+            _ => 0,
+        }
+    };
+
+    assert_eq!(selected, 3);
+
+    let tensor = Tensor::from_slice(&[0_f32; 6], &[2, 3]).unwrap();
+    let selected = match_any! {
+        Any::from(tensor) {
+            DirectShapeMatcher(_) => 0,
+            Tensor(tensor) => tensor.shape().len(),
+            _ => 0,
+        }
+    };
+    assert_eq!(selected, 2);
+}
+
+#[test]
+fn duplicate_patterns_keep_the_first_arm() {
     fn classify(value: Any) -> usize {
         match_any! {
             value {
