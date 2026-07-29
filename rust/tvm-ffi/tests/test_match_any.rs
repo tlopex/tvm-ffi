@@ -84,6 +84,15 @@ fn parameterized_containers_keep_ordered_conversion() {
     };
     assert_eq!(converted, vec![1.0, 2.0]);
 
+    let integer_array = [1_i64, 2].into_iter().collect::<Array<i64>>();
+    let wildcard_matched = match_any! {
+        Any::from(integer_array) {
+            Array::<f64>(_) => true,
+            _ => false,
+        }
+    };
+    assert!(wildcard_matched);
+
     let integer_map = [(1_i64, 10_i64)].into_iter().collect::<Map<i64, i64>>();
     let converted = match_any! {
         Any::from(integer_map) {
@@ -137,7 +146,21 @@ fn duplicate_patterns_keep_the_first_arm() {
             value {
                 Module(_) => 0,
                 Module(_) => 1,
-                _ => 2,
+                Module(_) => 2,
+                Module(_) => 3,
+                Module(_) => 4,
+                Module(_) => 5,
+                Module(_) => 6,
+                Module(_) => 7,
+                Module(_) => 8,
+                Module(_) => 9,
+                Module(_) => 10,
+                Module(_) => 11,
+                Module(_) => 12,
+                Module(_) => 13,
+                Module(_) => 14,
+                Module(_) => 15,
+                _ => 16,
             }
         }
     }
@@ -148,31 +171,88 @@ fn duplicate_patterns_keep_the_first_arm() {
         .unwrap()
         .try_into()
         .unwrap();
+    assert_eq!(classify(Any::from(module.clone())), 0);
+    assert_eq!(classify(Any::from(Array::<i64>::default())), 16);
     assert_eq!(classify(Any::from(module)), 0);
-    assert_eq!(classify(Any::from(Array::<i64>::default())), 2);
+    assert_eq!(classify(Any::from(1_i64)), 16);
 }
 
 #[test]
 fn lookup_table_maps_runtime_indices_to_local_arm_ids() {
     const ARM_0: ArmId = 0;
-    const ARM_1: ArmId = 1;
     const ARM_2: ArmId = 2;
     let pattern_list_id = TypeId::of::<(i32, i64, f32)>();
-    let table = LeafLookupTable::build(pattern_list_id, &[(73, ARM_0), (73, ARM_1), (75, ARM_2)]);
+    static TABLE: LeafLookupTable<8> = LeafLookupTable::new();
 
-    assert_eq!(table.lookup(pattern_list_id, 73), Ok(Some(ARM_0)));
-    assert_eq!(table.lookup(pattern_list_id, 72), Ok(None));
-    assert_eq!(table.lookup(pattern_list_id, 74), Ok(None));
-    assert_eq!(table.lookup(pattern_list_id, 75), Ok(Some(ARM_2)));
-    assert_eq!(table.lookup(pattern_list_id, 76), Ok(None));
+    assert_eq!(TABLE.initialize(pattern_list_id, [73, 73, 75]), Ok(()));
+    assert_eq!(TABLE.pattern_list_id(), Some(pattern_list_id));
+    assert_eq!(unsafe { TABLE.lookup_after_init(73) }, Some(ARM_0));
+    assert_eq!(unsafe { TABLE.lookup_after_init(72) }, None);
+    assert_eq!(unsafe { TABLE.lookup_after_init(74) }, None);
+    assert_eq!(unsafe { TABLE.lookup_after_init(75) }, Some(ARM_2));
+    assert_eq!(unsafe { TABLE.lookup_after_init(76) }, None);
 }
 
 #[test]
 fn a_generic_pattern_list_cannot_reuse_another_lists_table() {
     let pattern_list_id = TypeId::of::<(i32, i64)>();
-    let table = LeafLookupTable::build(pattern_list_id, &[(73, 0), (75, 1)]);
+    static TABLE: LeafLookupTable<4> = LeafLookupTable::new();
+    assert_eq!(TABLE.initialize(pattern_list_id, [73, 75]), Ok(()));
+    assert_eq!(unsafe { TABLE.lookup_after_init(73) }, Some(0));
 
-    assert_eq!(table.lookup(TypeId::of::<(u8, u16)>(), 73), Err(()));
+    assert_eq!(
+        TABLE.initialize(TypeId::of::<(u8, u16)>(), [76, 77]),
+        Err(())
+    );
+}
+
+#[test]
+fn lookup_table_handles_hash_collisions_when_indices_are_sparse() {
+    let pattern_list_id = TypeId::of::<(i32, i64)>();
+    static TABLE: LeafLookupTable<4> = LeafLookupTable::new();
+
+    // These indices collide under the table hash, and their span is too wide
+    // for the dense representation.
+    assert_eq!(TABLE.initialize(pattern_list_id, [64, 103]), Ok(()));
+    assert_eq!(unsafe { TABLE.lookup_after_init(64) }, Some(0));
+    assert_eq!(unsafe { TABLE.lookup_after_init(103) }, Some(1));
+    assert_eq!(unsafe { TABLE.lookup_after_init(104) }, None);
+}
+
+#[test]
+fn failed_validation_does_not_partially_initialize_the_table() {
+    let pattern_list_id = TypeId::of::<(i32, i64)>();
+    static TABLE: LeafLookupTable<4> = LeafLookupTable::new();
+
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TABLE.initialize(pattern_list_id, [0, 73])
+    }));
+    assert!(failed.is_err());
+    assert_eq!(TABLE.pattern_list_id(), None);
+
+    assert_eq!(TABLE.initialize(pattern_list_id, [73, 75]), Ok(()));
+    assert_eq!(unsafe { TABLE.lookup_after_init(73) }, Some(0));
+    assert_eq!(unsafe { TABLE.lookup_after_init(75) }, Some(1));
+}
+
+#[test]
+fn lookup_table_delays_initialization_once_and_publishes_concurrently() {
+    let pattern_list_id = TypeId::of::<(u32, u64)>();
+    static TABLE: LeafLookupTable<4> = LeafLookupTable::new();
+
+    assert!(!TABLE.should_initialize());
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                if TABLE.should_initialize() {
+                    assert_eq!(TABLE.initialize(pattern_list_id, [73, 75]), Ok(()));
+                    assert_eq!(unsafe { TABLE.lookup_after_init(73) }, Some(0));
+                    assert_eq!(unsafe { TABLE.lookup_after_init(75) }, Some(1));
+                }
+            });
+        }
+    });
+    assert_eq!(TABLE.pattern_list_id(), Some(pattern_list_id));
 }
 
 #[test]

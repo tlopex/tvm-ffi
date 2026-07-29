@@ -24,11 +24,10 @@ use syn::{braced, parenthesized, Expr, Pat, Path, Result, Token};
 
 use crate::utils::get_tvm_ffi_crate;
 
-// A warmed release benchmark found no stable lookup crossover through twelve
-// arms under a uniformly shuffled mix of every arm plus fallback. Keep the
-// optimization disabled until a representative workload supports a threshold.
-const ENABLE_LEAF_LOOKUP: bool = false;
-const MIN_LOOKUP_TABLE_ARMS: usize = 2;
+// Below this point the ordered path is faster, or the lookup advantage is too
+// small to amortize table initialization reliably. Keep one conservative,
+// benchmark-backed threshold for every supported simple binding shape.
+const MIN_LOOKUP_TABLE_ARMS: usize = 16;
 
 struct MatchAnyInput {
     scrutinee: Expr,
@@ -114,8 +113,7 @@ fn expand_match_any(input: MatchAnyInput) -> TokenStream {
     let scrutinee = input.scrutinee;
     let fallback = input.fallback;
     let arms = input.arms;
-    let can_attempt_leaf_lookup = ENABLE_LEAF_LOOKUP
-        && arms.len() >= MIN_LOOKUP_TABLE_ARMS
+    let can_attempt_leaf_lookup = arms.len() >= MIN_LOOKUP_TABLE_ARMS
         && arms
             .iter()
             .all(|arm| arm.guard.is_none() && is_simple_binding(&arm.binding));
@@ -138,7 +136,7 @@ fn expand_ordered_match(
     let converted = Ident::new("__tvm_ffi_match_any_converted", span);
     let view = Ident::new("__tvm_ffi_match_any_view", span);
     let rejected = Ident::new("__tvm_ffi_match_any_rejected", span);
-    let dispatch = expand_ordered_dispatch(arms, fallback, &view, &rejected);
+    let dispatch = expand_ordered_dispatch(tvm_ffi, arms, fallback, &view, &rejected);
 
     quote! {
         {
@@ -163,28 +161,32 @@ fn expand_ordered_match(
 }
 
 fn expand_ordered_dispatch(
+    tvm_ffi: &TokenStream,
     arms: &[TypedArm],
     fallback: &Expr,
     view: &Ident,
     rejected: &Ident,
 ) -> TokenStream {
-    expand_ordered_try_into_chain(arms, quote!({ #fallback }), view, rejected, |_, arm| {
-        let binding = &arm.binding;
-        let body = &arm.body;
-        if let Some(guard) = &arm.guard {
-            quote!(::core::result::Result::Ok(#binding) if #guard => { #body })
-        } else {
-            quote!(::core::result::Result::Ok(#binding) => { #body })
-        }
-    })
+    expand_ordered_chain(
+        tvm_ffi,
+        arms,
+        quote!({ #fallback }),
+        view,
+        rejected,
+        |_, arm| {
+            let body = &arm.body;
+            quote!({ #body })
+        },
+    )
 }
 
-fn expand_ordered_try_into_chain<F>(
+fn expand_ordered_chain<F>(
+    tvm_ffi: &TokenStream,
     arms: &[TypedArm],
     fallback: TokenStream,
     view: &Ident,
     rejected: &Ident,
-    mut matched_arm: F,
+    mut selected_arm: F,
 ) -> TokenStream
 where
     F: FnMut(usize, &TypedArm) -> TokenStream,
@@ -194,37 +196,85 @@ where
         .rev()
         .fold(fallback, |next, (arm_id, arm)| {
             let matcher = &arm.matcher;
-            let matched = matched_arm(arm_id, arm);
-
-            quote! {
-                match ::core::convert::TryInto::<#matcher>::try_into(#view) {
-                    #matched,
-                    #rejected => {
-                        ::core::mem::drop(#rejected);
-                        #next
+            let binding = &arm.binding;
+            let selected = selected_arm(arm_id, arm);
+            if matches!(binding, Pat::Wild(_)) {
+                let matched = expand_wildcard_condition(tvm_ffi, matcher, view, arm_id);
+                if let Some(guard) = &arm.guard {
+                    quote! {
+                        if #matched && (#guard) {
+                            #selected
+                        } else {
+                            #next
+                        }
+                    }
+                } else {
+                    quote! {
+                        if #matched {
+                            #selected
+                        } else {
+                            #next
+                        }
+                    }
+                }
+            } else {
+                let matched = if let Some(guard) = &arm.guard {
+                    quote!(::core::result::Result::Ok(#binding) if #guard => { #selected })
+                } else {
+                    quote!(::core::result::Result::Ok(#binding) => { #selected })
+                };
+                quote! {
+                    match ::core::convert::TryInto::<#matcher>::try_into(#view) {
+                        #matched,
+                        #rejected => {
+                            ::core::mem::drop(#rejected);
+                            #next
+                        }
                     }
                 }
             }
         })
 }
 
-fn expand_leaf_table_lookup(
+fn expand_wildcard_condition(
     tvm_ffi: &TokenStream,
-    arms: &[TypedArm],
-    arm_constants: &[Ident],
+    matcher: &Path,
     view: &Ident,
+    arm_id: usize,
 ) -> TokenStream {
+    let probe = Ident::new(
+        &format!("__tvm_ffi_match_any_ordered_probe_{arm_id}"),
+        Span::mixed_site(),
+    );
+
+    quote! {
+        {
+            use #tvm_ffi::match_any_internal::PatternMatchWithoutCopy as _;
+
+            let #probe =
+                #tvm_ffi::match_any_internal::LeafPatternProbe::<#matcher>::new();
+            match (&#probe).matches_without_copy(#view) {
+                ::core::option::Option::Some(matched) => matched,
+                ::core::option::Option::None => {
+                    ::core::convert::TryInto::<#matcher>::try_into(#view).is_ok()
+                }
+            }
+        }
+    }
+}
+
+fn expand_leaf_table_lookup(tvm_ffi: &TokenStream, arms: &[TypedArm], view: &Ident) -> TokenStream {
     let span = Span::mixed_site();
     let probe = Ident::new("__tvm_ffi_match_any_probe", span);
     let pattern_list_id = Ident::new("__tvm_ffi_match_any_leaf_pattern_list_id", span);
+    let initialized_pattern_list_id =
+        Ident::new("__tvm_ffi_match_any_initialized_pattern_list_id", span);
     let type_indices = Ident::new("__tvm_ffi_match_any_type_indices", span);
     let static_table = Ident::new("__TVM_FFI_MATCH_ANY_LEAF_TABLE", span);
     let table = Ident::new("__tvm_ffi_match_any_leaf_table", span);
     let arm_count = arms.len();
-    let lookup_entries = arm_constants
-        .iter()
-        .enumerate()
-        .map(|(arm_id, arm_constant)| quote!((#type_indices[#arm_id], #arm_constant)));
+    // Keep load at or below 50% so the hot path normally reaches one slot.
+    let table_capacity = (arm_count * 2).next_power_of_two();
     let pattern_list = arms
         .iter()
         .map(|arm| &arm.matcher)
@@ -239,18 +289,39 @@ fn expand_leaf_table_lookup(
                 #tvm_ffi::match_any_internal::LeafPatternProbe::<#pattern_list>::new();
             match (&#probe).leaf_pattern_list_id() {
                 ::core::option::Option::Some(#pattern_list_id) => {
-                    static #static_table: ::std::sync::OnceLock<
-                        #tvm_ffi::match_any_internal::LeafLookupTable,
-                    > = ::std::sync::OnceLock::new();
-                    let #table = #static_table.get_or_init(|| {
-                        let mut #type_indices = [0_i32; #arm_count];
-                        (&#probe).fill_leaf_type_indices(&mut #type_indices);
-                        #tvm_ffi::match_any_internal::LeafLookupTable::build(
-                            #pattern_list_id,
-                            &[#(#lookup_entries),*],
-                        )
-                    });
-                    #table.lookup(#pattern_list_id, #view.type_index())
+                    static #static_table:
+                        #tvm_ffi::match_any_internal::LeafLookupTable<#table_capacity>
+                        = #tvm_ffi::match_any_internal::LeafLookupTable::new();
+                    let #table = &#static_table;
+                    match #table.pattern_list_id() {
+                        ::core::option::Option::Some(#initialized_pattern_list_id)
+                            if #initialized_pattern_list_id == #pattern_list_id =>
+                        {
+                            ::core::result::Result::Ok(unsafe {
+                                #table.lookup_after_init(#view.type_index())
+                            })
+                        }
+                        ::core::option::Option::Some(_) => {
+                            ::core::result::Result::Err(())
+                        }
+                        ::core::option::Option::None if #table.should_initialize() => {
+                            let mut #type_indices = [0_i32; #arm_count];
+                            (&#probe).fill_leaf_type_indices(&mut #type_indices);
+                            match #table.initialize(#pattern_list_id, #type_indices) {
+                                ::core::result::Result::Ok(()) => {
+                                    ::core::result::Result::Ok(unsafe {
+                                        #table.lookup_after_init(#view.type_index())
+                                    })
+                                }
+                                ::core::result::Result::Err(()) => {
+                                    ::core::result::Result::Err(())
+                                }
+                            }
+                        }
+                        ::core::option::Option::None => {
+                            ::core::result::Result::Err(())
+                        }
+                    }
                 }
                 ::core::option::Option::None => {
                     ::core::result::Result::Err(())
@@ -261,6 +332,7 @@ fn expand_leaf_table_lookup(
 }
 
 fn expand_direct_leaf_selection(
+    tvm_ffi: &TokenStream,
     arms: &[TypedArm],
     arm_constants: &[Ident],
     arm_variants: &[Ident],
@@ -274,18 +346,44 @@ fn expand_direct_leaf_selection(
         let matcher = &arm.matcher;
         let variant = &arm_variants[arm_id];
         let arm_constant = &arm_constants[arm_id];
+        if matches!(arm.binding, Pat::Wild(_)) {
+            return quote! {
+                #arm_constant => {
+                    #selected_enum::#variant(
+                        ::core::marker::PhantomData::<#matcher>
+                    )
+                }
+            };
+        }
+        let value_probe = Ident::new(
+            &format!("__tvm_ffi_match_any_leaf_value_probe_{arm_id}"),
+            Span::mixed_site(),
+        );
 
         quote! {
             #arm_constant => {
-                match ::core::convert::TryInto::<#matcher>::try_into(#view) {
-                    ::core::result::Result::Ok(#selected_value) => {
+                use #tvm_ffi::match_any_internal::LeafPatternValue as _;
+
+                let #value_probe =
+                    #tvm_ffi::match_any_internal::LeafPatternProbe::<#matcher>::new();
+                match unsafe {
+                    (&#value_probe).copy_after_leaf_match(#view)
+                } {
+                    ::core::option::Option::Some(#selected_value) => {
                         #selected_enum::#variant(#selected_value)
                     }
-                    #rejected => {
-                        ::core::mem::drop(#rejected);
-                        ::core::panic!(
-                            "match_any! leaf lookup selected an incompatible arm"
-                        )
+                    ::core::option::Option::None => {
+                        match ::core::convert::TryInto::<#matcher>::try_into(#view) {
+                            ::core::result::Result::Ok(#selected_value) => {
+                                #selected_enum::#variant(#selected_value)
+                            }
+                            #rejected => {
+                                ::core::mem::drop(#rejected);
+                                ::core::panic!(
+                                    "match_any! leaf lookup selected an incompatible arm"
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -350,9 +448,21 @@ fn expand_leaf_lookup_match(
     let arm_types = (0..arm_count)
         .map(|arm_id| Ident::new(&format!("__TvmFfiMatchAnyType{arm_id}"), span))
         .collect::<Vec<_>>();
+    let arm_matcher_types = arms.iter().map(|arm| &arm.matcher).collect::<Vec<_>>();
     let arm_variants = (0..arm_count)
         .map(|arm_id| Ident::new(&format!("Arm{arm_id}"), span))
         .collect::<Vec<_>>();
+    let arm_variant_definitions =
+        arms.iter()
+            .zip(&arm_variants)
+            .zip(&arm_types)
+            .map(|((arm, variant), arm_type)| {
+                if matches!(arm.binding, Pat::Wild(_)) {
+                    quote!(#variant(::core::marker::PhantomData<#arm_type>))
+                } else {
+                    quote!(#variant(#arm_type))
+                }
+            });
     let arm_constants = (0..arm_count)
         .map(|arm_id| Ident::new(&format!("__TVM_FFI_MATCH_ANY_ARM_{arm_id}"), span))
         .collect::<Vec<_>>();
@@ -366,25 +476,31 @@ fn expand_leaf_lookup_match(
                         #arm_id as #tvm_ffi::match_any_internal::ArmId;
                 }
             });
-    let lookup_arm_id = expand_leaf_table_lookup(tvm_ffi, arms, &arm_constants, &view);
-
-    let ordered_selection = expand_ordered_try_into_chain(
+    let lookup_arm_id = expand_leaf_table_lookup(tvm_ffi, arms, &view);
+    let ordered_selection = expand_ordered_chain(
+        tvm_ffi,
         arms,
         quote!(#selected_enum::#fallback_variant),
         &view,
         &rejected,
-        |arm_id, _| {
+        |arm_id, arm| {
             let variant = &arm_variants[arm_id];
-
-            quote!(
-                ::core::result::Result::Ok(#selected_value) => {
-                    #selected_enum::#variant(#selected_value)
+            if matches!(arm.binding, Pat::Wild(_)) {
+                let matcher = &arm.matcher;
+                quote! {
+                    #selected_enum::#variant(
+                        ::core::marker::PhantomData::<#matcher>
+                    )
                 }
-            )
+            } else {
+                let binding = &arm.binding;
+                quote!(#selected_enum::#variant(#binding))
+            }
         },
     );
 
     let direct_selection = expand_direct_leaf_selection(
+        tvm_ffi,
         arms,
         &arm_constants,
         &arm_variants,
@@ -406,7 +522,7 @@ fn expand_leaf_lookup_match(
     quote! {
         {
             enum #selected_enum<#(#arm_types),*> {
-                #(#arm_variants(#arm_types),)*
+                #(#arm_variant_definitions,)*
                 #fallback_variant,
             }
 
@@ -421,27 +537,27 @@ fn expand_leaf_lookup_match(
                 ::core::result::Result::Ok(view) => view,
                 ::core::result::Result::Err(error) => match error {},
             };
-            let #selected =
-                if #view.type_index()
-                    >= #tvm_ffi::TypeIndex::kTVMFFIStaticObjectBegin as i32
-                {
-                    match #lookup_arm_id {
-                        ::core::result::Result::Ok(
-                            ::core::option::Option::Some(#arm_id),
-                        ) => {
-                            #direct_selection
-                        }
-                        ::core::result::Result::Ok(
-                            ::core::option::Option::None,
-                        ) => {
+            let #selected: #selected_enum<#(#arm_matcher_types),*> =
+                match #lookup_arm_id {
+                    ::core::result::Result::Ok(
+                        ::core::option::Option::Some(#arm_id),
+                    ) => {
+                        #direct_selection
+                    }
+                    ::core::result::Result::Ok(
+                        ::core::option::Option::None,
+                    ) => {
+                        #selected_enum::#fallback_variant
+                    }
+                    ::core::result::Result::Err(()) => {
+                        if #view.type_index()
+                            >= #tvm_ffi::TypeIndex::kTVMFFIStaticObjectBegin as i32
+                        {
+                            #ordered_selection
+                        } else {
                             #selected_enum::#fallback_variant
                         }
-                        ::core::result::Result::Err(()) => {
-                            #ordered_selection
-                        }
                     }
-                } else {
-                    #selected_enum::#fallback_variant
                 };
             #body_dispatch
         }
