@@ -204,6 +204,13 @@ impl Function {
     /// # Returns
     /// * `Result<()>` - The result of the registration
     pub fn register_global(name: &str, func: Function) -> Result<()> {
+        if ObjectArc::is_null(&func.data) {
+            crate::bail!(
+                crate::error::VALUE_ERROR,
+                "Cannot register undefined Function {}",
+                name
+            );
+        }
         unsafe {
             let name_arg = TVMFFIByteArray::from_str(name);
             let can_override = 0;

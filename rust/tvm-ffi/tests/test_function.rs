@@ -34,6 +34,16 @@ fn test_function_get_global_required() {
 }
 
 #[test]
+fn test_register_global_rejects_undefined_function() {
+    let function = <Function as ObjectRefCore>::from_data(unsafe {
+        ObjectArc::<tvm_ffi::function::FunctionObj>::from_raw(std::ptr::null())
+    });
+    let error = Function::register_global("testing.undefined_function", function)
+        .expect_err("an undefined Function must not enter the C++ global registry");
+    assert_eq!(error.kind(), VALUE_ERROR);
+}
+
+#[test]
 fn test_function_from_packed() {
     let value = 2;
     let v2 = 4;
