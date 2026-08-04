@@ -153,15 +153,19 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
         unsafe impl #tvm_ffi_crate::object::ObjectRefCore for #struct_name {
             type ContainerType = <#data_ty as std::ops::Deref>::Target;
             #[inline]
-            fn data(this: &Self) -> &ObjectArc<Self::ContainerType> {
+            fn data(this: &Self) -> &#tvm_ffi_crate::object::ObjectArc<Self::ContainerType> {
                 &this.data
             }
             #[inline]
-            fn into_data(this: Self) -> ObjectArc<Self::ContainerType> {
+            fn into_data(
+                this: Self
+            ) -> #tvm_ffi_crate::object::ObjectArc<Self::ContainerType> {
                 this.data
             }
             #[inline]
-            fn from_data(data: ObjectArc<Self::ContainerType>) -> Self {
+            fn from_data(
+                data: #tvm_ffi_crate::object::ObjectArc<Self::ContainerType>
+            ) -> Self {
                 Self { data}
             }
         }
@@ -270,7 +274,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
 
             unsafe fn try_cast_from_any_view(
                 data: & #tvm_ffi_crate::tvm_ffi_sys::TVMFFIAny
-            ) -> Result<Self, ()> {
+            ) -> ::core::result::Result<Self, ()> {
                 type ContainerType = <#struct_name as #tvm_ffi_crate::object::ObjectRefCore>
                     ::ContainerType;
                 if #tvm_ffi_crate::object::is_instance_of::<ContainerType>(data.type_index) {

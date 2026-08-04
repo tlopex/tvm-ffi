@@ -37,6 +37,15 @@ pub struct Any {
     data: TVMFFIAny,
 }
 
+/// Owning, type-erased value that can be used as an `Array`/`Map` element.
+///
+/// This transparent newtype exists because Rust's blanket `From<T> for T`
+/// prevents `Any` itself from implementing `AnyCompatible` while the crate
+/// also provides the ergonomic generic `From<T> for Any` conversion.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct AnyValue(Any);
+
 //---------------------
 // AnyView
 //---------------------
@@ -252,6 +261,75 @@ impl Drop for Any {
         if self.data.type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32 {
             unsafe { object::unsafe_::dec_ref(self.data.data_union.v_obj) }
         }
+    }
+}
+
+impl AnyValue {
+    /// Wrap any value accepted by [`Any`] for use in a heterogeneous container.
+    pub fn from_value<T>(value: T) -> Self
+    where
+        T: Into<Any>,
+    {
+        Self(value.into())
+    }
+
+    /// Borrow the contained owning `Any`.
+    pub fn as_any(&self) -> &Any {
+        &self.0
+    }
+
+    /// Attempt an exact, owning conversion without consuming this value.
+    pub fn try_as<T>(&self) -> Option<T>
+    where
+        T: AnyCompatible,
+    {
+        self.0.try_as()
+    }
+
+    /// Consume this wrapper and return its owning `Any`.
+    pub fn into_any(self) -> Any {
+        self.0
+    }
+}
+
+impl From<Any> for AnyValue {
+    fn from(value: Any) -> Self {
+        Self(value)
+    }
+}
+
+unsafe impl AnyCompatible for AnyValue {
+    fn type_str() -> std::string::String {
+        "Any".to_string()
+    }
+
+    unsafe fn copy_to_any_view(src: &Self, data: &mut TVMFFIAny) {
+        *data = src.0.data;
+    }
+
+    unsafe fn move_to_any(src: Self, data: &mut TVMFFIAny) {
+        *data = Any::into_raw_ffi_any(src.0);
+    }
+
+    unsafe fn check_any_strict(_data: &TVMFFIAny) -> bool {
+        true
+    }
+
+    unsafe fn copy_from_any_view_after_check(data: &TVMFFIAny) -> Self {
+        let mut owned = TVMFFIAny::new();
+        crate::check_safe_call!(TVMFFIAnyViewToOwnedAny(data, &mut owned))
+            .expect("copying a valid TVMFFIAny view must succeed");
+        Self(Any { data: owned })
+    }
+
+    unsafe fn move_from_any_after_check(data: &mut TVMFFIAny) -> Self {
+        let owned = *data;
+        *data = TVMFFIAny::new();
+        Self(Any { data: owned })
+    }
+
+    unsafe fn try_cast_from_any_view(data: &TVMFFIAny) -> Result<Self, ()> {
+        Ok(Self::copy_from_any_view_after_check(data))
     }
 }
 

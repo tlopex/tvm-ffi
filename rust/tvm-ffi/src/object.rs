@@ -19,7 +19,9 @@
 use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 
+use crate::any::{Any, TryFromTemp};
 use crate::derive::ObjectRef;
+use crate::error::Result;
 use crate::type_traits::AnyCompatible;
 pub use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 /// Object related ABI handling
@@ -171,6 +173,12 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
 #[inline(always)]
 pub fn is_instance_of<Target: ObjectCore>(object_type_index: i32) -> bool {
     let target_type_index = Target::type_index();
+    is_instance_of_index(object_type_index, target_type_index)
+}
+
+/// Runtime-index form of [`is_instance_of`].
+#[doc(hidden)]
+pub fn is_instance_of_index(object_type_index: i32, target_type_index: i32) -> bool {
     if object_type_index == target_type_index {
         return true;
     }
@@ -185,16 +193,130 @@ pub fn is_instance_of<Target: ObjectCore>(object_type_index: i32) -> bool {
     }
     unsafe {
         let object_info = TVMFFIGetTypeInfo(object_type_index);
-        if object_info.is_null() {
+        let target_info = TVMFFIGetTypeInfo(target_type_index);
+        if object_info.is_null() || target_info.is_null() {
             return false;
         }
-        let target_depth = Target::TYPE_DEPTH;
+        let target_depth = (*target_info).type_depth;
         if (*object_info).type_depth <= target_depth {
             return false;
         }
         let ancestor = *(*object_info).type_acenstors.add(target_depth as usize);
         !ancestor.is_null() && (*ancestor).type_index == target_type_index
     }
+}
+
+/// Read one reflected object field through the runtime's owning getter.
+///
+/// Generated bindings use this path instead of constructing a Rust reference
+/// to the complete C++ node layout. The loaded runtime supplies the field
+/// offset and getter. The result is an owning [`Any`].
+#[doc(hidden)]
+pub fn get_object_field_any<O>(object: &O, owner_type_index: i32, field_name: &str) -> Result<Any>
+where
+    O: ObjectRefCore,
+{
+    unsafe {
+        let object_ptr = ObjectArc::as_raw(O::data(object));
+        if object_ptr.is_null() {
+            crate::bail!(
+                crate::error::VALUE_ERROR,
+                "cannot read field `{}` from an undefined object",
+                field_name
+            );
+        }
+        let header = object_ptr as *mut TVMFFIObject;
+        if !is_instance_of_index((*header).type_index, owner_type_index) {
+            crate::bail!(
+                crate::error::TYPE_ERROR,
+                "runtime object type_index `{}` is not an instance of field owner `{}`",
+                (*header).type_index,
+                owner_type_index
+            );
+        }
+
+        let owner_info = TVMFFIGetTypeInfo(owner_type_index);
+        if owner_info.is_null() {
+            crate::bail!(
+                crate::error::TYPE_ERROR,
+                "no type info for field owner type_index `{}`",
+                owner_type_index
+            );
+        }
+        let owner_info = &*owner_info;
+        for index in 0..owner_info.num_fields {
+            let field = &*owner_info.fields.add(index as usize);
+            if field.name.as_str() != field_name {
+                continue;
+            }
+            let getter = match field.getter {
+                Some(getter) => getter,
+                None => {
+                    crate::bail!(
+                        crate::error::RUNTIME_ERROR,
+                        "reflected field `{}` has no getter",
+                        field_name
+                    )
+                }
+            };
+            if field.offset < 0
+                || field.size < 0
+                || field.alignment <= 0
+                || field.offset % field.alignment != 0
+            {
+                crate::bail!(
+                    crate::error::RUNTIME_ERROR,
+                    "reflected field `{}` has an invalid layout",
+                    field_name
+                );
+            }
+            if !owner_info.metadata.is_null() {
+                let total_size = (*owner_info.metadata).total_size;
+                let field_end = field.offset.checked_add(field.size);
+                if total_size > 0
+                    && match field_end {
+                        Some(end) => end > i64::from(total_size),
+                        None => true,
+                    }
+                {
+                    crate::bail!(
+                        crate::error::RUNTIME_ERROR,
+                        "reflected field `{}` extends beyond its owner object",
+                        field_name
+                    );
+                }
+            }
+            let field_ptr = (header as *mut u8).add(field.offset as usize);
+            if field_ptr as usize % field.alignment as usize != 0 {
+                crate::bail!(
+                    crate::error::RUNTIME_ERROR,
+                    "reflected field `{}` is not correctly aligned",
+                    field_name
+                );
+            }
+            let mut result = TVMFFIAny::new();
+            crate::check_safe_call!(getter(field_ptr.cast(), &mut result))?;
+            return Ok(Any::from_raw_ffi_any(result));
+        }
+        crate::bail!(
+            crate::error::ATTRIBUTE_ERROR,
+            "field `{}` is not registered on type `{}`",
+            field_name,
+            owner_info.type_key.as_str()
+        )
+    }
+}
+
+/// Read and type-check one reflected object field.
+#[doc(hidden)]
+pub fn get_object_field<T, O>(object: &O, owner_type_index: i32, field_name: &str) -> Result<T>
+where
+    T: AnyCompatible,
+    O: ObjectRefCore,
+{
+    let owned = get_object_field_any(object, owner_type_index, field_name)?;
+    let converted: TryFromTemp<T> = owned.try_into()?;
+    Ok(TryFromTemp::into_value(converted))
 }
 
 /// Runtime-checked casting between arbitrary `ObjectRef` types.

@@ -347,3 +347,17 @@ fn test_any_dl_device() {
     assert_eq!(converted_cuda_view.device_type, DLDeviceType::kDLCUDA);
     assert_eq!(converted_cuda_view.device_id, 1);
 }
+
+#[test]
+fn test_any_value_preserves_heterogeneous_array_elements() {
+    let values = Array::new(vec![
+        AnyValue::from_value(7_i64),
+        AnyValue::from_value(String::from("hello")),
+    ]);
+
+    let first = values.get(0).unwrap();
+    assert_eq!(first.try_as::<i64>(), Some(7));
+
+    let second = values.get(1).unwrap().into_any();
+    assert_eq!(second.try_as::<String>().unwrap(), String::from("hello"));
+}

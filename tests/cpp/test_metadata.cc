@@ -85,20 +85,23 @@ TEST(Schema, GlobalFuncTypeSchema) {
             R"({"type":"ffi.Function","args":[{"type":"ffi.String"},{"type":"ffi.String"}]})");
   EXPECT_EQ(fetch("testing.schema_id_bytes"),
             R"({"type":"ffi.Function","args":[{"type":"ffi.Bytes"},{"type":"ffi.Bytes"}]})");
-  EXPECT_EQ(fetch("testing.schema_id_func"),
-            R"({"type":"ffi.Function","args":[{"type":"ffi.Function"},{"type":"ffi.Function"}]})");
+  EXPECT_EQ(
+      fetch("testing.schema_id_func"),
+      R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"ffi.Function"}]},{"type":"Optional","args":[{"type":"ffi.Function"}]}]})");
   EXPECT_EQ(
       fetch("testing.schema_id_func_typed"),
-      R"({"type":"ffi.Function","args":[{"type":"ffi.Function","args":[{"type":"None"},{"type":"int"},{"type":"float"},{"type":"ffi.Function"}]},{"type":"ffi.Function","args":[{"type":"None"},{"type":"int"},{"type":"float"},{"type":"ffi.Function"}]}]})");
+      R"({"type":"ffi.Function","args":[{"type":"ffi.Function","args":[{"type":"None"},{"type":"int"},{"type":"float"},{"type":"Optional","args":[{"type":"ffi.Function"}]}]},{"type":"ffi.Function","args":[{"type":"None"},{"type":"int"},{"type":"float"},{"type":"Optional","args":[{"type":"ffi.Function"}]}]}]})");
 
   EXPECT_EQ(fetch("testing.schema_id_any"),
             R"({"type":"ffi.Function","args":[{"type":"Any"},{"type":"Any"}]})");
-  EXPECT_EQ(fetch("testing.schema_id_object"),
-            R"({"type":"ffi.Function","args":[{"type":"ffi.Object"},{"type":"ffi.Object"}]})");
+  EXPECT_EQ(
+      fetch("testing.schema_id_object"),
+      R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"ffi.Object"}]},{"type":"Optional","args":[{"type":"ffi.Object"}]}]})");
   EXPECT_EQ(fetch("testing.schema_id_dltensor"),
             R"({"type":"ffi.Function","args":[{"type":"DLTensor*"},{"type":"DLTensor*"}]})");
-  EXPECT_EQ(fetch("testing.schema_id_tensor"),
-            R"({"type":"ffi.Function","args":[{"type":"ffi.Tensor"},{"type":"ffi.Tensor"}]})");
+  EXPECT_EQ(
+      fetch("testing.schema_id_tensor"),
+      R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"ffi.Tensor"}]},{"type":"Optional","args":[{"type":"ffi.Tensor"}]}]})");
   EXPECT_EQ(fetch("testing.schema_tensor_view_input"),
             R"({"type":"ffi.Function","args":[{"type":"None"},{"type":"DLTensor*"}]})");
   EXPECT_EQ(
@@ -109,7 +112,7 @@ TEST(Schema, GlobalFuncTypeSchema) {
       R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"ffi.String"}]},{"type":"Optional","args":[{"type":"ffi.String"}]}]})");
   EXPECT_EQ(
       fetch("testing.schema_id_opt_obj"),
-      R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"ffi.Object"}]},{"type":"Optional","args":[{"type":"ffi.Object"}]}]})");
+      R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"Optional","args":[{"type":"ffi.Object"}]}]},{"type":"Optional","args":[{"type":"Optional","args":[{"type":"ffi.Object"}]}]}]})");
   EXPECT_EQ(
       fetch("testing.schema_id_arr_int"),
       R"({"type":"ffi.Function","args":[{"type":"ffi.Array","args":[{"type":"int"}]},{"type":"ffi.Array","args":[{"type":"int"}]}]})");
@@ -118,7 +121,7 @@ TEST(Schema, GlobalFuncTypeSchema) {
       R"({"type":"ffi.Function","args":[{"type":"ffi.Array","args":[{"type":"ffi.String"}]},{"type":"ffi.Array","args":[{"type":"ffi.String"}]}]})");
   EXPECT_EQ(
       fetch("testing.schema_id_arr_obj"),
-      R"({"type":"ffi.Function","args":[{"type":"ffi.Array","args":[{"type":"ffi.Object"}]},{"type":"ffi.Array","args":[{"type":"ffi.Object"}]}]})");
+      R"({"type":"ffi.Function","args":[{"type":"ffi.Array","args":[{"type":"Optional","args":[{"type":"ffi.Object"}]}]},{"type":"ffi.Array","args":[{"type":"Optional","args":[{"type":"ffi.Object"}]}]}]})");
   EXPECT_EQ(fetch("testing.schema_id_arr"),
             R"({"type":"ffi.Function","args":[{"type":"ffi.Array"},{"type":"ffi.Array"}]})");
   EXPECT_EQ(
@@ -129,7 +132,7 @@ TEST(Schema, GlobalFuncTypeSchema) {
       R"({"type":"ffi.Function","args":[{"type":"ffi.Map","args":[{"type":"ffi.String"},{"type":"ffi.String"}]},{"type":"ffi.Map","args":[{"type":"ffi.String"},{"type":"ffi.String"}]}]})");
   EXPECT_EQ(
       fetch("testing.schema_id_map_str_obj"),
-      R"({"type":"ffi.Function","args":[{"type":"ffi.Map","args":[{"type":"ffi.String"},{"type":"ffi.Object"}]},{"type":"ffi.Map","args":[{"type":"ffi.String"},{"type":"ffi.Object"}]}]})");
+      R"({"type":"ffi.Function","args":[{"type":"ffi.Map","args":[{"type":"ffi.String"},{"type":"Optional","args":[{"type":"ffi.Object"}]}]},{"type":"ffi.Map","args":[{"type":"ffi.String"},{"type":"Optional","args":[{"type":"ffi.Object"}]}]}]})");
   EXPECT_EQ(fetch("testing.schema_id_map"),
             R"({"type":"ffi.Function","args":[{"type":"ffi.Map"},{"type":"ffi.Map"}]})");
   EXPECT_EQ(
@@ -137,7 +140,8 @@ TEST(Schema, GlobalFuncTypeSchema) {
       R"({"type":"ffi.Function","args":[{"type":"Variant","args":[{"type":"int"},{"type":"ffi.String"}]},{"type":"Variant","args":[{"type":"int"},{"type":"ffi.String"}]}]})");
 
   // Packed function registered via def_packed: schema is plain ffi.Function
-  EXPECT_EQ(fetch("testing.schema_packed"), R"({"type":"ffi.Function"})");
+  EXPECT_EQ(fetch("testing.schema_packed"),
+            R"({"type":"Optional","args":[{"type":"ffi.Function"}]})");
 
   // Mixed containers and optionals
   EXPECT_EQ(
@@ -214,7 +218,7 @@ TEST(Schema, MethodTypeSchemas) {
   // Build expected JSON as ffi.Function with return type = type_key and args = (int, float, str)
   EXPECT_EQ(
       method_schema("make_with"),
-      R"({"type":"ffi.Function","args":[{"type":"testing.SchemaAllTypes"},{"type":"int"},{"type":"float"},{"type":"ffi.String"}]})");
+      R"({"type":"ffi.Function","args":[{"type":"Optional","args":[{"type":"testing.SchemaAllTypes"}]},{"type":"int"},{"type":"float"},{"type":"ffi.String"}]})");
 }
 
 TEST(Schema, DLLExportedFuncMetadata) {

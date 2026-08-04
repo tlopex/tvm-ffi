@@ -34,7 +34,7 @@ pub mod string;
 pub mod type_traits;
 pub use tvm_ffi_sys;
 
-pub use crate::any::{Any, AnyView};
+pub use crate::any::{Any, AnyValue, AnyView};
 pub use crate::collections::array::Array;
 pub use crate::collections::map::Map;
 pub use crate::collections::shape::Shape;
@@ -51,7 +51,7 @@ pub use crate::extra::structural_visit::{
     StructuralVisitor, VisitDispatch, VisitInterrupt, VisitValue, WalkChainLink, WalkOrder,
     WalkResult,
 };
-pub use crate::function::Function;
+pub use crate::function::{get_kwargs_object, Function};
 pub use crate::object::ObjectRefCast;
 pub use crate::object::{Object, ObjectArc, ObjectCore, ObjectCoreWithExtraItems, ObjectRefCore};
 pub use crate::optional::Optional;

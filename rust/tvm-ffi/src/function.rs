@@ -20,10 +20,12 @@ use crate::any::{Any, AnyView};
 use crate::derive::{Object, ObjectRef};
 use crate::error::{Error, Result};
 use crate::function_internal::{AsPackedCallable, TupleAsPackedArgs};
-use crate::object::{Object, ObjectArc, ObjectCore};
+use crate::object::{Object, ObjectArc, ObjectCore, ObjectRef};
+use crate::type_traits::AnyCompatible;
 use tvm_ffi_sys::{
     TVMFFIAny, TVMFFIByteArray, TVMFFIFunctionCell, TVMFFIFunctionCreate, TVMFFIFunctionGetGlobal,
-    TVMFFIFunctionSetGlobal, TVMFFIObjectHandle, TVMFFISafeCallType, TVMFFITypeIndex,
+    TVMFFIFunctionSetGlobal, TVMFFIGetTypeAttrColumn, TVMFFIGetTypeInfo, TVMFFIObjectHandle,
+    TVMFFISafeCallType, TVMFFITypeIndex,
 };
 
 /// function object
@@ -196,6 +198,101 @@ impl Function {
         }
     }
 
+    /// Cached front of [`Function::get_global`] for generated bindings.
+    pub fn get_global_cached(
+        cell: &'static std::thread::LocalKey<std::cell::OnceCell<Function>>,
+        name: &str,
+    ) -> Result<Function> {
+        cell.with(|cell| {
+            if let Some(function) = cell.get() {
+                return Ok(function.clone());
+            }
+            let function = Self::get_global(name)?;
+            let _ = cell.set(function.clone());
+            Ok(function)
+        })
+    }
+
+    /// Look up a reflected method or type attribute as an FFI function.
+    ///
+    /// Explicit `TypeMethod` entries take precedence. Auto-generated hooks
+    /// such as `__ffi_init__` live in a `TypeAttrColumn`, so the column is the
+    /// required fallback. This matches the Python binding's lookup order.
+    pub fn from_type_method(type_index: i32, method_name: &str) -> Result<Function> {
+        unsafe {
+            let info = TVMFFIGetTypeInfo(type_index);
+            if info.is_null() {
+                crate::bail!(
+                    crate::error::TYPE_ERROR,
+                    "no type info for type_index `{}`",
+                    type_index
+                );
+            }
+            let info = &*info;
+            for index in 0..info.num_methods {
+                let method = &*info.methods.add(index as usize);
+                if method.name.as_str() == method_name {
+                    if !<Function as AnyCompatible>::check_any_strict(&method.method) {
+                        crate::bail!(
+                            crate::error::TYPE_ERROR,
+                            "method `{}` on type_index `{}` is not a Function",
+                            method_name,
+                            type_index
+                        );
+                    }
+                    return Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
+                        &method.method,
+                    ));
+                }
+            }
+
+            let attr_name = TVMFFIByteArray::from_str(method_name);
+            let column = TVMFFIGetTypeAttrColumn(&attr_name);
+            if !column.is_null() {
+                let column = &*column;
+                let offset = type_index - column.begin_index;
+                if offset >= 0 && offset < column.size && !column.data.is_null() {
+                    let attr = &*column.data.add(offset as usize);
+                    if attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32 {
+                        if !<Function as AnyCompatible>::check_any_strict(attr) {
+                            crate::bail!(
+                                crate::error::TYPE_ERROR,
+                                "type attribute `{}` on type_index `{}` is not a Function",
+                                method_name,
+                                type_index
+                            );
+                        }
+                        return Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
+                            attr,
+                        ));
+                    }
+                }
+            }
+        }
+        crate::bail!(
+            crate::error::TYPE_ERROR,
+            "method `{}` not found on type_index `{}`",
+            method_name,
+            type_index
+        )
+    }
+
+    /// Cached front of [`Function::from_type_method`] for generated bindings.
+    pub fn from_type_method_cached(
+        cell: &'static std::thread::LocalKey<std::cell::OnceCell<Function>>,
+        type_index: i32,
+        method_name: &str,
+    ) -> Result<Function> {
+        cell.with(|cell| {
+            if let Some(function) = cell.get() {
+                return Ok(function.clone());
+            }
+            let function = Self::from_type_method(type_index, method_name)?;
+            let _ = cell.set(function.clone());
+            Ok(function)
+        })
+    }
+
     /// Register a function as a global function
     /// # Arguments
     /// * `name` - The name of the function
@@ -282,4 +379,23 @@ impl Function {
             }
         }
     }
+}
+
+/// Return the process-wide sentinel used by the packed KWARGS protocol.
+///
+/// The object is cached per thread because FFI object handles are not `Sync`.
+pub fn get_kwargs_object() -> Result<ObjectRef> {
+    thread_local! {
+        static KWARGS: std::cell::OnceCell<ObjectRef> = const { std::cell::OnceCell::new() };
+    }
+    KWARGS.with(|cell| {
+        if let Some(value) = cell.get() {
+            return Ok(value.clone());
+        }
+        let value: ObjectRef = Function::get_global("ffi.GetKwargsObject")?
+            .call_packed(&[])?
+            .try_into()?;
+        let _ = cell.set(value.clone());
+        Ok(value)
+    })
 }

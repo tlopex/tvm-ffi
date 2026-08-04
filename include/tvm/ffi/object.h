@@ -1608,7 +1608,14 @@ struct ObjectRefTypeTraitsBase : public TypeTraitsBase {
 
   TVM_FFI_INLINE static std::string TypeStr() { return ContainerType::_type_key; }
   TVM_FFI_INLINE static std::string TypeSchema() {
-    return R"({"type":")" + std::string(ContainerType::_type_key) + R"("})";
+    std::string object_schema = R"({"type":")" + std::string(ContainerType::_type_key) + R"("})";
+    if constexpr (TObjRef::_type_is_nullable) {
+      // Nullability belongs to the ObjectRef wrapper, not its Object node.
+      // Preserve it in every reflected field/function schema so language
+      // bindings do not have to guess whether FFI None is accepted.
+      return R"({"type":"Optional","args":[)" + object_schema + "]}";
+    }
+    return object_schema;
   }
 };
 

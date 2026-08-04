@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from . import consts as C
 from .python_generator import PythonGenerator
+from .rust_generator import RustGenerator
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -172,6 +173,10 @@ class Generator(Protocol):
         """Return text appended to a freshly scaffolded package entry (Python ``__init__.py``)."""
         ...
 
+    def validate_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
+        """Validate language-specific tree finalization without writing files."""
+        ...
+
     def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
         """Post-``--init`` hook to stitch the generated tree after file creation."""
         ...
@@ -179,6 +184,7 @@ class Generator(Protocol):
 
 _GENERATORS: dict[str, Generator] = {
     "python": PythonGenerator(),
+    "rust": RustGenerator(),
 }
 
 

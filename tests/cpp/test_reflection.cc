@@ -113,6 +113,14 @@ TEST(Reflection, GetFieldByteOffset) {
   EXPECT_EQ(reflection::GetFieldByteOffsetToObject(&TIntObj::value), sizeof(TVMFFIObject));
 }
 
+TEST(Reflection, ObjectRefTypeSchemaPreservesNullability) {
+  EXPECT_EQ(TypeTraits<TNumber>::TypeSchema(),
+            R"({"type":"Optional","args":[{"type":"test.Number"}]})");
+  EXPECT_EQ(TypeTraits<Optional<TNumber>>::TypeSchema(),
+            R"({"type":"Optional","args":[{"type":"Optional","args":[{"type":"test.Number"}]}]})");
+  EXPECT_EQ(TypeTraits<TInt>::TypeSchema(), R"({"type":"test.Int"})");
+}
+
 TEST(Reflection, FieldGetter) {
   ObjectRef a = TInt(10);
   reflection::FieldGetter getter("test.Int", "value");

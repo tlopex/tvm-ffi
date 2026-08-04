@@ -21,12 +21,36 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import os
+import stat
+import tempfile
 import traceback
 from collections.abc import Generator, Iterable
 from pathlib import Path
 from typing import Callable
 
 from . import consts as C
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` with UTF-8 ``text`` using a same-directory temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.exists():
+            temporary.chmod(stat.S_IMODE(path.stat().st_mode))
+        else:
+            # mkstemp intentionally starts at 0600. Generated source files are
+            # ordinary repository content, so make fresh files group/world
+            # readable while keeping existing file modes unchanged.
+            temporary.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def syntax_for(path: Path) -> C.MarkerSyntax:
@@ -153,11 +177,11 @@ class FileInfo:
                     print(line)
         self.lines = new_lines
         if not dry_run:
-            self.path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+            write_text_atomic(self.path, "\n".join(self.lines) + "\n")
         return True
 
     @staticmethod
-    def from_file(  # noqa: PLR0912
+    def from_file(
         file: Path, include_empty: bool = False, syntax: C.MarkerSyntax | None = None
     ) -> FileInfo | None:
         """Parse a file to extract code blocks based on stub markers.
@@ -166,11 +190,26 @@ class FileInfo:
         ``syntax`` is not given.
         """
         assert file.is_file(), f"Expected a file, but got: {file}"
+        return FileInfo.from_text(
+            file,
+            file.read_text(encoding="utf-8"),
+            include_empty=include_empty,
+            syntax=syntax,
+        )
+
+    @staticmethod
+    def from_text(  # noqa: PLR0912
+        file: Path,
+        source: str,
+        include_empty: bool = False,
+        syntax: C.MarkerSyntax | None = None,
+    ) -> FileInfo | None:
+        """Parse in-memory source using the same rules as :meth:`from_file`."""
         file = file.resolve()
         if syntax is None:
             syntax = syntax_for(file)
         has_marker = False
-        lines: list[str] = file.read_text(encoding="utf-8").splitlines()
+        lines = source.splitlines()
         for _, line in enumerate(lines, start=1):
             if line.strip().startswith(syntax.skip_file):
                 return None

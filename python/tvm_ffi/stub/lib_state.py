@@ -23,11 +23,11 @@ import heapq
 from collections import defaultdict
 
 from tvm_ffi._ffi_api import GetRegisteredTypeKeys
-from tvm_ffi.core import TypeSchema, _lookup_or_register_type_info_from_type_key
+from tvm_ffi.core import _lookup_or_register_type_info_from_type_key
 from tvm_ffi.registry import get_global_func_metadata, list_global_func_names
 
 from . import consts as C
-from .utils import FuncInfo, NamedTypeSchema, ObjectInfo
+from .utils import FuncInfo, NamedTypeSchema, ObjectInfo, _parse_func_type_schema
 
 
 @functools.cache
@@ -114,7 +114,7 @@ def _func_info_from_global_name(name: str) -> FuncInfo:
     return FuncInfo(
         schema=NamedTypeSchema(
             name=name,
-            schema=TypeSchema.from_json_str(get_global_func_metadata(name)["type_schema"]),
+            schema=_parse_func_type_schema(get_global_func_metadata(name)["type_schema"]),
         ),
         is_member=False,
     )

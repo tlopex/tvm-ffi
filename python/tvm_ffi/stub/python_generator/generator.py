@@ -151,5 +151,8 @@ class PythonGenerator:
         """Return text appended to a scaffolded ``__init__.py``."""
         return G.generate_python_init(code_blocks, module_name, submodule, self.syntax)
 
+    def validate_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
+        """No-op: Python packages need no parent-declares-child wiring."""
+
     def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
         """No-op: Python packages need no parent-declares-child wiring."""

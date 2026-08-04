@@ -69,12 +69,14 @@ class MarkerSyntax:
 
 
 PYTHON_SYNTAX = MarkerSyntax(comment="#")
+RUST_SYNTAX = MarkerSyntax(comment="//")
 
 #: Map a source-file extension to the marker syntax used inside it. The block
 #: parser selects the syntax per file.
 SYNTAX_BY_EXT: dict[str, MarkerSyntax] = {
     ".py": PYTHON_SYNTAX,
     ".pyi": PYTHON_SYNTAX,
+    ".rs": RUST_SYNTAX,
 }
 
 STUB_BLOCK_KINDS: TypeAlias = Literal[

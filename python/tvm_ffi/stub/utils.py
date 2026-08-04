@@ -39,6 +39,34 @@ def _parse_type_schema(raw: str | dict[str, Any]) -> TypeSchema:
     return TypeSchema.from_json_str(raw)
 
 
+def _parse_func_type_schema(raw: str | dict[str, Any]) -> TypeSchema:
+    """Parse callable metadata, normalizing nullable bare Function schemas.
+
+    A ``def_packed`` registration has no signature and historically reports a
+    bare ``ffi.Function`` schema.  Nullable ObjectRef schema preservation wraps
+    that marker in ``Optional``, but it still describes the registered callable
+    itself -- not a zero-argument function returning ``Function``.
+    """
+    schema = _parse_type_schema(raw)
+    if (
+        schema.origin == "Optional"
+        and len(schema.args) == 1
+        and schema.args[0].origin == "Callable"
+        and not schema.args[0].args
+    ):
+        return schema.args[0]
+    return schema
+
+
+class UnsupportedTypeError(Exception):
+    """Raised when a backend cannot safely represent an FFI construct."""
+
+    def __init__(self, origin: str, reason: str | None = None) -> None:
+        """Record the offending origin and a user-facing reason."""
+        super().__init__(reason or f"unsupported FFI type {origin!r}")
+        self.origin = origin
+
+
 @dataclasses.dataclass
 class InitConfig:
     """Configuration for generating new stubs.
@@ -82,18 +110,38 @@ class Options:
     dry_run: bool = False
     target: str = "python"
     """Code generator target to use."""
+    strict: bool = True
+    """Fail the command if any requested construct cannot be generated."""
 
 
 @dataclasses.dataclass(init=False)
 class NamedTypeSchema(TypeSchema):
-    """A type schema with an associated name."""
+    """A named schema plus the reflected native field layout, when present."""
 
     name: str
+    size: int | None = None
+    alignment: int | None = None
+    offset: int | None = None
 
-    def __init__(self, name: str, schema: TypeSchema) -> None:
-        """Initialize a `NamedTypeSchema` with the given name and schema."""
-        super().__init__(origin=schema.origin, args=schema.args)
+    def __init__(
+        self,
+        name: str,
+        schema: TypeSchema,
+        *,
+        size: int | None = None,
+        alignment: int | None = None,
+        offset: int | None = None,
+    ) -> None:
+        """Initialize from a schema while preserving its semantic metadata."""
+        super().__init__(
+            origin=schema.origin,
+            args=schema.args,
+            origin_type_index=schema.origin_type_index,
+        )
         self.name = name
+        self.size = size
+        self.alignment = alignment
+        self.offset = offset
 
 
 @dataclasses.dataclass
@@ -129,6 +177,10 @@ class ObjectInfo:
     parent_type_key: str | None = None
     init_fields: list[InitFieldInfo] = dataclasses.field(default_factory=list)
     has_init: bool = False
+    type_index: int | None = None
+    total_size: int | None = None
+    alignment: int | None = None
+    has_type_metadata: bool = False
 
     def has_overloaded_methods(self) -> bool:
         """Return whether reflection exposed multiple signatures for a method."""
@@ -170,6 +222,9 @@ class ObjectInfo:
                             schema=NamedTypeSchema(
                                 name=field.name,
                                 schema=_parse_type_schema(field.metadata["type_schema"]),
+                                size=field.size,
+                                alignment=field.alignment,
+                                offset=field.offset,
                             ),
                             kw_only=field.c_kw_only,
                             has_default=field.c_has_default,
@@ -181,6 +236,9 @@ class ObjectInfo:
                 NamedTypeSchema(
                     name=field.name,
                     schema=_parse_type_schema(field.metadata["type_schema"]),
+                    size=field.size,
+                    alignment=field.alignment,
+                    offset=field.offset,
                 )
                 for field in type_info.fields
             ],
@@ -188,7 +246,7 @@ class ObjectInfo:
                 FuncInfo(
                     schema=NamedTypeSchema(
                         name=C.FN_NAME_MAP.get(method.name, method.name),
-                        schema=_parse_type_schema(method.metadata["type_schema"]),
+                        schema=_parse_func_type_schema(method.metadata["type_schema"]),
                     ),
                     is_member=not method.is_static,
                 )
@@ -198,4 +256,10 @@ class ObjectInfo:
             parent_type_key=parent_type_key,
             init_fields=init_fields,
             has_init=has_init,
+            type_index=type_info.type_index,
+            total_size=type_info.total_size if type_info._has_type_metadata else None,
+            # The current C ABI publishes field alignment but not alignof(Class).
+            # Do not guess: opaque/reflection-backed Rust bindings do not need it.
+            alignment=None,
+            has_type_metadata=type_info._has_type_metadata,
         )
