@@ -32,6 +32,7 @@ pub mod object;
 pub mod optional;
 pub mod string;
 pub mod type_traits;
+pub mod typed_expr;
 pub use tvm_ffi_sys;
 
 pub use crate::any::{Any, AnyValue, AnyView};
@@ -57,6 +58,7 @@ pub use crate::object::{Object, ObjectArc, ObjectCore, ObjectCoreWithExtraItems,
 pub use crate::optional::Optional;
 pub use crate::string::{Bytes, String};
 pub use crate::type_traits::AnyCompatible;
+pub use crate::typed_expr::TypedExpr;
 pub use tvm_ffi_macros::{dispatch, match_any};
 
 pub use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;

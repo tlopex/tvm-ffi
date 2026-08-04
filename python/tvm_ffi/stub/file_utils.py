@@ -23,7 +23,6 @@ import difflib
 import os
 import stat
 import tempfile
-import traceback
 from collections.abc import Generator, Iterable
 from pathlib import Path
 from typing import Callable
@@ -279,21 +278,20 @@ class FileInfo:
 
 
 def collect_files(paths: list[Path]) -> list[FileInfo]:
-    """Collect all files from the given paths and parse them into FileInfo objects."""
+    """Collect requested files, propagating every walk and parse failure."""
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError("stubgen input path does not exist: " + ", ".join(missing))
 
-    def _on_error(e: Exception) -> None:
-        print(
-            f"{C.TERM_RED}[Error]\n{traceback.format_exc()}{C.TERM_RESET}",
-            end="",
-            flush=True,
-        )
+    def _raise(error: Exception) -> None:
+        raise error
 
     def _walk_recursive() -> Generator[Path, None, None]:
         for p in paths:
             if p.is_file():
                 yield p
                 continue
-            for root, _dirs, files in path_walk(p, follow_symlinks=False, on_error=_on_error):
+            for root, _dirs, files in path_walk(p, follow_symlinks=False, on_error=_raise):
                 for file in files:
                     f = Path(root) / file
                     if f.suffix.lower() not in C.DEFAULT_SOURCE_EXTS:
@@ -307,13 +305,9 @@ def collect_files(paths: list[Path]) -> list[FileInfo]:
     filenames = sorted(filenames, key=_path_sort_key)
     files = []
     for file in filenames:
-        try:
-            content = FileInfo.from_file(file)
-        except Exception as e:
-            _on_error(e)
-        else:
-            if content is not None:
-                files.append(content)
+        content = FileInfo.from_file(file)
+        if content is not None:
+            files.append(content)
     return files
 
 

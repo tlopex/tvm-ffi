@@ -46,10 +46,10 @@ from tvm_ffi.stub.rust_generator.utils import (
 from tvm_ffi.stub.utils import (
     FuncInfo,
     InitConfig,
-    InitFieldInfo,
     NamedTypeSchema,
     ObjectInfo,
     Options,
+    UnsupportedTypeError,
     _parse_func_type_schema,
 )
 
@@ -116,6 +116,31 @@ def test_nested_optional_schema_uses_single_wire_option() -> None:
     assert result == "Option<Node>"
 
 
+def test_typed_expr_schema_preserves_result_type_refinement() -> None:
+    imports = RustImports()
+
+    def render(origin: str) -> str:
+        path = RUST_TY_MAP_DEFAULTS.get(origin, origin.replace(".", "::"))
+        return imports.record(path)
+
+    schema = TypeSchema(
+        "Optional",
+        (
+            TypeSchema(
+                "TypedExpr",
+                (TypeSchema("test.Expr"), TypeSchema("test.PrimType")),
+            ),
+        ),
+    )
+
+    assert render_rust_type(schema, render) == "Option<TypedExpr<Expr, PrimType>>"
+    assert {item.path for item in imports.items} == {
+        "tvm_ffi::TypedExpr",
+        "test::Expr",
+        "test::PrimType",
+    }
+
+
 def test_nullable_bare_function_metadata_remains_packed() -> None:
     schema = _parse_func_type_schema({"type": "Optional", "args": [{"type": "ffi.Function"}]})
     source = _generate_globals([FuncInfo.from_schema("test.DynamicCall", schema)])
@@ -124,12 +149,13 @@ def test_nullable_bare_function_metadata_remains_packed() -> None:
     assert "pub fn dynamic_call()" not in source
 
 
-def test_generated_object_is_opaque_and_reflection_backed() -> None:
+def test_object_api_exposes_only_proven_safe_operations() -> None:
     info = ObjectInfo(
         fields=[NamedTypeSchema("value", TypeSchema("int"), size=4, alignment=4, offset=24)],
         methods=[],
         type_key="test.Node",
         parent_type_key="ffi.Object",
+        has_init=True,
     )
     source = _generate_object(info)
 
@@ -139,53 +165,73 @@ def test_generated_object_is_opaque_and_reflection_backed() -> None:
     assert "get_object_field::<i64, _>" in source
     assert "ObjectArc::new" not in source
     assert "DerefMut" not in source
-    assert "build_obj" not in source
+    assert "Builder" not in source
+    assert "build_unchecked" not in source
+    assert "pub fn same_as" not in source
+    assert "pub fn downcast" not in source
 
-
-def test_auto_constructor_is_named_kwargs_builder() -> None:
-    optional = NamedTypeSchema("span", TypeSchema("Optional", (TypeSchema("test.Span"),)))
-    required = NamedTypeSchema("value", TypeSchema("int"))
-    info = ObjectInfo(
-        fields=[optional, required],
-        methods=[],
-        type_key="test.Node",
-        parent_type_key="ffi.Object",
-        init_fields=[
-            InitFieldInfo("span", optional, kw_only=True, has_default=True),
-            InitFieldInfo("value", required, kw_only=False, has_default=False),
-        ],
-        has_init=True,
+    # Keep the marker on derived objects too: a standalone generation request
+    # may inherit from an external parent whose auto-trait contract is unknown.
+    derived = _generate_object(
+        ObjectInfo(
+            fields=[],
+            methods=[],
+            type_key="test.Child",
+            parent_type_key="test.Node",
+        )
     )
-    source = _generate_object(info)
-
-    assert "span: Option<Option<Span>>" in source
-    assert "pub fn ffi_new_unchecked() -> NodeBuilder" in source
-    assert "pub fn with_span(mut self, value: Option<Span>) -> Self" in source
-    assert "pub fn with_value(mut self, value: i64) -> Self" in source
-    assert "pub unsafe fn build_unchecked(self) -> Result<Node>" in source
-    assert "get_kwargs_object()?" in source
-    assert 'String::from("span")' in source
-    assert "field `value` is not set" in source
-    assert "pub fn ffi_new(" not in source
-    assert "pub fn build(" not in source
-    assert "ObjectArc::new" not in source
+    assert "base: NodeObj" in derived
+    assert "_not_send_sync: PhantomData<Rc<()>>" in derived
 
 
-def test_builder_setter_normalizes_dunder_field_name() -> None:
-    field = NamedTypeSchema("__dict__", TypeSchema("int"))
+def test_only_explicitly_reflected_constructor_is_emitted() -> None:
+    constructor = FuncInfo.from_schema(
+        "__ffi_init__",
+        TypeSchema(
+            "Callable",
+            (
+                TypeSchema("Optional", (TypeSchema("test.Node"),)),
+                TypeSchema("int"),
+            ),
+        ),
+    )
     source = _generate_object(
         ObjectInfo(
-            fields=[field],
-            methods=[],
+            fields=[],
+            methods=[constructor],
             type_key="test.Node",
             parent_type_key="ffi.Object",
-            init_fields=[InitFieldInfo("__dict__", field, kw_only=True, has_default=False)],
             has_init=True,
         )
     )
 
-    assert "pub fn with_dict(" in source
-    assert "with___dict__" not in source
+    assert "pub fn ffi_new(_0: i64) -> Result<Node>" in source
+    assert 'from_type_method_cached(&F, NodeObj::type_index(), "__ffi_init__")' in source
+    assert "ObjectArc::new" not in source
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        FuncInfo.from_schema("__ffi_init__", TypeSchema("Callable"), is_member=False),
+        FuncInfo.from_schema(
+            "__ffi_init__",
+            TypeSchema("Callable", (TypeSchema("test.Node"),)),
+            is_member=True,
+        ),
+    ],
+)
+def test_invalid_reflected_constructor_fails_closed(constructor: FuncInfo) -> None:
+    info = ObjectInfo(
+        fields=[],
+        methods=[constructor],
+        type_key="test.Node",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+
+    with pytest.raises(UnsupportedTypeError, match="typed static factory"):
+        _generate_object(info)
 
 
 def test_overloaded_methods_receive_stable_names() -> None:
@@ -223,6 +269,16 @@ def test_global_wrapper_is_typed_and_cached() -> None:
     source = "\n".join(block.lines)
     assert "pub fn skip_assert(_0: Node) -> Result<Node>" in source
     assert 'get_global_cached(&F, "test.transform.SkipAssert")' in source
+
+
+def test_unsupported_global_schema_aborts_generation() -> None:
+    function = FuncInfo.from_schema(
+        "test.Unsupported",
+        TypeSchema("Callable", (TypeSchema("mystery"),)),
+    )
+
+    with pytest.raises(UnsupportedTypeError, match="unsupported FFI type 'mystery'"):
+        _generate_globals([function])
 
 
 def test_union_and_tuple_globals_use_type_erased_boundary() -> None:
@@ -346,7 +402,7 @@ def test_atomic_writer_uses_source_file_modes(tmp_path: Path) -> None:
 def test_rust_init_scaffolding_stays_in_memory_and_deduplicates_mod_rs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(stub_cli, "collect_type_keys", lambda: {"test": []})
+    monkeypatch.setattr(stub_cli, "collect_type_keys", lambda *_args: {"test": []})
     monkeypatch.setattr(stub_cli, "toposort_objects", lambda objects: [])
     function = FuncInfo.from_schema(
         "test.Identity",
@@ -459,16 +515,15 @@ def test_module_finalization_rejects_malformed_markers_without_writes(
 
 
 @pytest.mark.parametrize(
-    ("strict", "dry_run", "failed", "should_write"),
+    ("dry_run", "failed", "should_write"),
     [
-        (True, False, True, False),
-        (True, True, False, False),
-        (False, False, True, True),
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
     ],
 )
-def test_commit_policy_preserves_strict_and_dry_run_transactionality(
+def test_commit_policy_is_fail_closed_and_honors_dry_run(
     tmp_path: Path,
-    strict: bool,
     dry_run: bool,
     failed: bool,
     should_write: bool,
@@ -482,7 +537,7 @@ def test_commit_policy_preserves_strict_and_dry_run_transactionality(
 
     committed = _commit_files(
         [file],
-        Options(target="rust", strict=strict, dry_run=dry_run),
+        Options(target="rust", dry_run=dry_run),
         failed=failed,
     )
 
@@ -493,12 +548,12 @@ def test_commit_policy_preserves_strict_and_dry_run_transactionality(
         assert path.read_text(encoding="utf-8") == original
 
 
-def test_strict_failure_and_dry_run_do_not_create_scaffold_files(tmp_path: Path) -> None:
+def test_failure_and_dry_run_do_not_create_scaffold_files(tmp_path: Path) -> None:
     for options, failed in [
-        (Options(target="rust", strict=True), True),
-        (Options(target="rust", strict=True, dry_run=True), False),
+        (Options(target="rust"), True),
+        (Options(target="rust", dry_run=True), False),
     ]:
-        path = tmp_path / ("strict.rs" if failed else "dry-run.rs")
+        path = tmp_path / ("failed.rs" if failed else "dry-run.rs")
         file = FileInfo.from_text(
             path,
             f"{C.RUST_SYNTAX.begin} global/test\n{C.RUST_SYNTAX.end}\n",
@@ -510,26 +565,7 @@ def test_strict_failure_and_dry_run_do_not_create_scaffold_files(tmp_path: Path)
         assert not path.exists()
 
 
-def test_finalization_preflight_blocks_allow_partial_writes(tmp_path: Path) -> None:
-    path = tmp_path / "generated.rs"
-    original = f"{C.RUST_SYNTAX.begin} global/test\n{C.RUST_SYNTAX.end}\n"
-    path.write_text(original, encoding="utf-8")
-    file = FileInfo.from_file(path)
-    assert file is not None
-    file.code_blocks[0].lines.insert(1, "pub fn generated() {}")
-
-    committed = _commit_files(
-        [file],
-        Options(target="rust", strict=False),
-        failed=True,
-        block_writes=True,
-    )
-
-    assert not committed
-    assert path.read_text(encoding="utf-8") == original
-
-
-def test_strict_finalization_preflight_fails_before_generated_file_commit(
+def test_finalization_preflight_fails_before_generated_file_commit(
     tmp_path: Path,
 ) -> None:
     module_file = tmp_path / "mod.rs"
@@ -542,12 +578,11 @@ def test_strict_finalization_preflight_fails_before_generated_file_commit(
     file.code_blocks[0].lines.insert(1, "pub fn generated() {}")
     options = Options(
         target="rust",
-        strict=True,
         init=InitConfig(pkg="test", shared_target="test", prefix="test"),
     )
 
     failed = _validate_init(True, options, tmp_path, {"test"}, get_generator("rust"))
-    committed = _commit_files([file], options, failed, block_writes=failed)
+    committed = _commit_files([file], options, failed)
 
     assert failed
     assert not committed

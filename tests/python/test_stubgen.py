@@ -26,8 +26,9 @@ from tvm_ffi import Object, method
 from tvm_ffi.core import TypeSchema
 from tvm_ffi.dataclasses import py_class
 from tvm_ffi.stub import consts as C
+from tvm_ffi.stub import lib_state
 from tvm_ffi.stub.cli import _stage_2, _stage_3
-from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.file_utils import CodeBlock, FileInfo, collect_files
 from tvm_ffi.stub.generator import get_generator
 from tvm_ffi.stub.python_generator import consts as PC
 from tvm_ffi.stub.python_generator.codegen import (
@@ -53,6 +54,7 @@ from tvm_ffi.stub.utils import (
     ObjectInfo,
     Options,
 )
+from tvm_ffi.testing import TestIntPair
 
 _counter = itertools.count()
 
@@ -75,6 +77,31 @@ def _type_suffix(name: str) -> str:
 
 def _input_type_suffix(name: str) -> str:
     return PC.TY_MAP_INPUT_DEFAULTS.get(name, PC.TY_MAP_DEFAULTS.get(name, name)).rsplit(".", 1)[-1]
+
+
+def test_registry_collection_never_silently_omits_invalid_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_metadata(_: str) -> dict[str, str]:
+        raise KeyError("type_schema")
+
+    monkeypatch.setattr(
+        lib_state,
+        "list_global_func_names",
+        lambda: ["Unqualified", "other.broken", "test.broken"],
+    )
+    monkeypatch.setattr(lib_state, "get_global_func_metadata", missing_metadata)
+    lib_state._func_info_from_global_name.cache_clear()
+
+    with pytest.raises(RuntimeError, match=r"type schema.*'test\.broken'"):
+        lib_state.collect_global_funcs({"test"})
+
+    monkeypatch.setattr(
+        lib_state,
+        "GetRegisteredTypeKeys",
+        lambda: ["UnqualifiedType", "other.Node", "test.Node"],
+    )
+    assert lib_state.collect_type_keys((), {"test"}) == {"test": ["test.Node"]}
 
 
 def test_codeblock_from_begin_line_variants() -> None:
@@ -114,6 +141,16 @@ def test_fileinfo_from_file_skip_and_missing_markers(tmp_path: Path) -> None:
     plain = tmp_path / "plain.py"
     plain.write_text("print('plain')\n", encoding="utf-8")
     assert FileInfo.from_file(plain) is None
+
+
+def test_collect_files_is_fail_closed_for_missing_or_malformed_inputs(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="input path does not exist"):
+        collect_files([tmp_path / "missing.py"])
+
+    malformed = tmp_path / "malformed.py"
+    malformed.write_text(f"{C.PYTHON_SYNTAX.begin} global/test\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unclosed stub block"):
+        collect_files([malformed])
 
 
 def test_fileinfo_from_file_parses_blocks(tmp_path: Path) -> None:
@@ -331,6 +368,26 @@ def test_type_schema_container_origins() -> None:
     assert s.repr() == "list[int]"
     s = TypeSchema("dict", (TypeSchema("str"), TypeSchema("int")))
     assert s.repr() == "dict[str, int]"
+
+
+def test_typed_expr_schema_is_structural_but_python_uses_base_type() -> None:
+    schema = TypeSchema.from_json_str(
+        '{"type":"TypedExpr","args":['
+        '{"type":"testing.TestIntPair"},'
+        '{"type":"testing.TestObjectBase"}]}'
+    )
+
+    assert schema.origin == "TypedExpr"
+    base = TypeSchema("testing.TestIntPair")
+    assert schema.output_repr() == base.output_repr()
+    assert schema.input_repr() == base.input_repr()
+    assert schema.is_subtype_of(TestIntPair)
+    schema.check_value(TestIntPair(1, 2))
+    with pytest.raises(TypeError, match=r"testing\.TestIntPair"):
+        schema.check_value(1)
+
+    with pytest.raises(ValueError, match="exactly two arguments"):
+        TypeSchema("TypedExpr", (TypeSchema("testing.TestIntPair"),))
 
 
 def test_objectinfo_gen_fields_container_types() -> None:
@@ -922,7 +979,7 @@ def test_stage_2_filters_prefix_and_marks_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prefixes: dict[str, list[FuncInfo]] = {"demo.sub": [], "demo": [], "other": []}
-    monkeypatch.setattr(stub_cli, "collect_type_keys", lambda: prefixes)
+    monkeypatch.setattr(stub_cli, "collect_type_keys", lambda *_args: prefixes)
     monkeypatch.setattr(stub_cli, "toposort_objects", lambda objs: [])
 
     global_funcs = {

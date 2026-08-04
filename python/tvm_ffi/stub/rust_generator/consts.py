@@ -33,6 +33,7 @@ RUST_TY_MAP_DEFAULTS = {
     "Callable": "tvm_ffi::Function",
     "Array": "tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
     "Map": "tvm_ffi::Map",  # the crate's own Map<K, V>, NOT HashMap
+    "TypedExpr": "tvm_ffi::TypedExpr",
     # A generic/opaque object VALUE is the single-pointer `ObjectRef` handle
     # (AnyCompatible, niche-optimizable), NOT the 24-byte `Object` data struct
     # (which is only ever the embedded struct `base`, spelled literally by codegen).

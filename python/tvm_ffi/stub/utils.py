@@ -110,8 +110,6 @@ class Options:
     dry_run: bool = False
     target: str = "python"
     """Code generator target to use."""
-    strict: bool = True
-    """Fail the command if any requested construct cannot be generated."""
 
 
 @dataclasses.dataclass(init=False)

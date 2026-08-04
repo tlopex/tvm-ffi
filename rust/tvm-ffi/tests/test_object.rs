@@ -171,4 +171,7 @@ fn test_object_arc_nullable_representation() {
     let defined_ref = <ObjectRef as ObjectRefCore>::from_data(ObjectArc::new(Object::new()));
     assert!(!defined_ref.is_null());
     assert!(defined_ref.is_defined());
+    assert!(defined_ref.same_as(&defined_ref.clone()));
+    let other_ref = <ObjectRef as ObjectRefCore>::from_data(ObjectArc::new(Object::new()));
+    assert!(!defined_ref.same_as(&other_ref));
 }

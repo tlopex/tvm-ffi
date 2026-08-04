@@ -21,12 +21,12 @@ from __future__ import annotations
 import functools
 import heapq
 from collections import defaultdict
+from collections.abc import Collection
 
 from tvm_ffi._ffi_api import GetRegisteredTypeKeys
 from tvm_ffi.core import _lookup_or_register_type_info_from_type_key
 from tvm_ffi.registry import get_global_func_metadata, list_global_func_names
 
-from . import consts as C
 from .utils import FuncInfo, NamedTypeSchema, ObjectInfo, _parse_func_type_schema
 
 
@@ -38,34 +38,52 @@ def object_info_from_type_key(type_key: str) -> ObjectInfo:
     return ObjectInfo.from_type_info(type_info)
 
 
-def collect_global_funcs() -> dict[str, list[FuncInfo]]:
-    """Collect global functions from TVM FFI's global registry."""
+def _prefix_is_requested(
+    prefix: str,
+    exact_prefixes: Collection[str] | None,
+    recursive_prefixes: Collection[str],
+) -> bool:
+    """Return whether a namespaced registry entry is in the requested scope."""
+    if not prefix:
+        return False
+    if exact_prefixes is None:
+        return True
+    return prefix in exact_prefixes or any(
+        prefix == root or prefix.startswith(f"{root}.") for root in recursive_prefixes
+    )
+
+
+def collect_global_funcs(
+    exact_prefixes: Collection[str] | None = None,
+    recursive_prefixes: Collection[str] = (),
+) -> dict[str, list[FuncInfo]]:
+    """Collect and validate global functions inside the requested namespaces."""
     global_funcs: dict[str, list[FuncInfo]] = {}
     for name in list_global_func_names():
+        prefix, separator, _ = name.rpartition(".")
+        if not separator or not _prefix_is_requested(prefix, exact_prefixes, recursive_prefixes):
+            continue
         try:
-            prefix, _ = name.rsplit(".", 1)
-        except ValueError:
-            print(f"{C.TERM_YELLOW}[Skipped] Invalid name in global function: {name}{C.TERM_RESET}")
-        else:
-            try:
-                global_funcs.setdefault(prefix, []).append(_func_info_from_global_name(name))
-            except Exception:
-                print(f"{C.TERM_YELLOW}[Skipped] Function has no type schema: {name}{C.TERM_RESET}")
+            info = _func_info_from_global_name(name)
+        except Exception as err:
+            raise RuntimeError(f"failed to read type schema for global function {name!r}") from err
+        global_funcs.setdefault(prefix, []).append(info)
     for k in list(global_funcs.keys()):
         global_funcs[k].sort(key=lambda x: x.schema.name)
     return global_funcs
 
 
-def collect_type_keys() -> dict[str, list[str]]:
-    """Collect registered object type keys from TVM FFI's global registry."""
+def collect_type_keys(
+    exact_prefixes: Collection[str] | None = None,
+    recursive_prefixes: Collection[str] = (),
+) -> dict[str, list[str]]:
+    """Collect object type keys inside the requested namespaces."""
     global_objects: dict[str, list[str]] = {}
     for type_key in GetRegisteredTypeKeys():
-        try:
-            prefix, _ = type_key.rsplit(".", 1)
-        except ValueError:
-            pass
-        else:
-            global_objects.setdefault(prefix, []).append(type_key)
+        prefix, separator, _ = type_key.rpartition(".")
+        if not separator or not _prefix_is_requested(prefix, exact_prefixes, recursive_prefixes):
+            continue
+        global_objects.setdefault(prefix, []).append(type_key)
     for k in list(global_objects.keys()):
         global_objects[k].sort()
     return global_objects

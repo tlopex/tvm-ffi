@@ -249,10 +249,16 @@ def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str
             (payload,) = payload.args
         return f"Option<{_element_rust_type(payload, ty_render)}>"
 
-    if origin == "Callable":
-        # The crate's Function is type-erased: no generic params.
-        return ty_render("Callable")
+    if origin == "TypedExpr":
+        if len(args) != 2:
+            raise UnsupportedTypeError(origin, "TypedExpr requires exactly two arguments")
+        base, expected = args
+        return (
+            f"{ty_render('TypedExpr')}<"
+            f"{render_rust_type(base, ty_render)}, {render_rust_type(expected, ty_render)}>"
+        )
 
+    # Callable maps to the crate's type-erased Function like any other leaf.
     return ty_render(origin)  # leaf / object type
 
 

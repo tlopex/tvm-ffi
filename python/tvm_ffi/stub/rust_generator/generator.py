@@ -46,9 +46,9 @@ if TYPE_CHECKING:
 class RustGenerator:
     """Generator that emits Rust binding stubs.
 
-    Generated object nodes are opaque prefix markers.  Field access and object
-    construction delegate to the loaded runtime's reflection API, so Rust never
-    mirrors or allocates a complete C++ object layout.  Schemas without a native
+    Generated object nodes are opaque prefix markers. Field reads, reflected
+    methods, and explicitly registered constructors delegate to the loaded
+    runtime, so Rust never mirrors or allocates a complete C++ object layout. Schemas without a native
     Rust sum/container representation remain available through type-erased
     ``Any`` carriers rather than being silently omitted.
     """

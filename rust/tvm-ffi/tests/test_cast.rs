@@ -129,11 +129,13 @@ fn test_upcast_downcast_roundtrip() {
     assert_eq!(base.data.value, 7);
     // upcast further to the root ObjectRef
     let obj: ObjectRef = base.try_cast().unwrap();
-    // downcast all the way back
-    let derived2: TestDerived = obj.try_cast().unwrap();
+    // Borrowing downcast preserves the original handle and object identity.
+    let derived2: TestDerived = obj.downcast().unwrap();
     assert_eq!(derived2.data.base.value, 7);
     assert_eq!(derived2.data.extra, 8);
-    // every step moved ownership; no extra references were created
+    assert!(derived2.same_as(&obj));
+    assert_eq!(ObjectArc::strong_count(&derived2.data), 2);
+    drop(obj);
     assert_eq!(ObjectArc::strong_count(&derived2.data), 1);
     assert_eq!(delete_counter.load(Ordering::Relaxed), 0);
     drop(derived2);
@@ -145,6 +147,20 @@ fn test_cast_checks_parameterized_container_type() {
     assert!(Array::new(vec![1_i64, 2_i64])
         .try_cast::<Array<f32>>()
         .is_err());
+}
+
+#[test]
+fn test_typed_expr_conversion_checks_reflected_result_type() {
+    let delete_counter = Arc::new(AtomicU32::new(0));
+    let base = new_base(1, delete_counter.clone());
+
+    // TestBase has no reflected `ty`; neither direct nor Any conversion may
+    // manufacture a refinement solely from the base object's type index.
+    assert!(TypedExpr::<TestBase, i64>::try_from_base(base.clone()).is_err());
+    assert!(TypedExpr::<TestBase, i64>::try_from(AnyView::from(&base)).is_err());
+    assert!(TypedExpr::<TestBase, i64>::try_from(Any::from(base.clone())).is_err());
+    drop(base);
+    assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
 }
 
 #[test]

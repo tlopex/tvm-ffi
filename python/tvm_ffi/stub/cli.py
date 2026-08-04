@@ -35,7 +35,7 @@ from .lib_state import (
     object_info_from_type_key,
     toposort_objects,
 )
-from .utils import FuncInfo, InitConfig, Options, UnsupportedTypeError
+from .utils import FuncInfo, InitConfig, Options
 
 if TYPE_CHECKING:
     from .generator import Generator
@@ -52,22 +52,26 @@ def __main__() -> int:
     generator = get_generator(opt.target)
     dlls = _load_extensions(opt)
     files, init_path = _collect_inputs(opt)
-    global_funcs = collect_global_funcs()
+    exact_prefixes = {
+        code.param[0]
+        for file in files
+        for code in file.code_blocks
+        if code.kind == "global" and isinstance(code.param, tuple)
+    }
+    recursive_prefixes = {opt.init.prefix.rstrip(".")} if opt.init is not None else set()
+    global_funcs = collect_global_funcs(exact_prefixes, recursive_prefixes)
 
-    # All generation happens against in-memory FileInfo objects.  In strict
-    # mode no file is committed if any collection, scaffolding, or rendering
-    # step fails; allow-partial mode commits the successful portions.
+    # All generation happens against in-memory FileInfo objects. No file is
+    # committed if any collection, scaffolding, or rendering step fails.
     ty_map, collect_failed = _collect_type_map(files, generator)
     generated_prefixes, scaffold_failed = _generate_scaffolds(
         files, opt, init_path, ty_map, global_funcs, generator
     )
     render_failed = _render_files(files, opt, ty_map, global_funcs, generator)
     failed = collect_failed or scaffold_failed or render_failed
-    preflight_failed = _validate_init(
-        not failed or not opt.strict, opt, init_path, generated_prefixes, generator
-    )
+    preflight_failed = _validate_init(not failed, opt, init_path, generated_prefixes, generator)
     failed |= preflight_failed
-    committed = _commit_files(files, opt, failed, block_writes=preflight_failed)
+    committed = _commit_files(files, opt, failed)
     failed |= _finalize_init(
         committed and not preflight_failed, opt, init_path, generated_prefixes, generator
     )
@@ -167,18 +171,14 @@ def _render_files(
     return failed
 
 
-def _commit_files(
-    files: list[FileInfo], opt: Options, failed: bool, *, block_writes: bool = False
-) -> bool:
-    """Atomically write generated files when the selected policy permits it."""
-    # A malformed module tree cannot be made coherent by a partial commit, so
-    # finalization preflight failures block writes in both generation modes.
-    commit_outputs = not block_writes and (not failed or not opt.strict)
+def _commit_files(files: list[FileInfo], opt: Options, failed: bool) -> bool:
+    """Atomically write generated files only after every stage succeeds."""
+    commit_outputs = not failed
     if commit_outputs:
         for file in files:
             file.update(verbose=opt.verbose, dry_run=opt.dry_run)
     elif opt.verbose:
-        # A strict failure may still show the complete would-be diff.
+        # A failed dry run may still show the complete would-be diff.
         for file in files:
             file.update(verbose=True, dry_run=True)
     return commit_outputs and not opt.dry_run
@@ -191,7 +191,7 @@ def _validate_init(
     generated_prefixes: set[str],
     generator: Generator,
 ) -> bool:
-    """Preflight tree finalization so a strict failure precedes all writes."""
+    """Preflight tree finalization so a failure precedes all writes."""
     if not would_commit or opt.init is None or not generated_prefixes:
         return False
     try:
@@ -292,7 +292,7 @@ def _stage_2(
     if prefix_filter and not prefix_filter.endswith("."):
         prefix_filter += "."
     root_prefix = prefix_filter.rstrip(".")
-    prefixes: dict[str, list[str]] = collect_type_keys()
+    prefixes: dict[str, list[str]] = collect_type_keys((), {root_prefix})
     for prefix in global_funcs:
         prefixes.setdefault(prefix, [])
     generated_prefixes: set[str] = set()
@@ -309,7 +309,7 @@ def _stage_2(
             continue
         generated_prefixes.add(prefix)
         # Step 1. Compute the target path. Directories/files are committed only
-        # after every strict-mode input has generated successfully.
+        # after every input has generated successfully.
         directory = init_path / prefix.replace(".", "/")
         # Step 2. Generate the API file.
         api_filename = generator.api_filename()
@@ -344,7 +344,6 @@ def _stage_3(  # noqa: PLR0912
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
     imports = generator.new_imports()
-    skipped_objects: list[tuple[str, str]] = []
     # Stage 1. Collect `tvm-ffi-stubgen(import-object): ...`
     for code in file.code_blocks:
         if code.kind == "import-object":
@@ -364,16 +363,7 @@ def _stage_3(  # noqa: PLR0912
             assert isinstance(type_key, str)
             obj_info = object_info_from_type_key(type_key)
             type_key = ty_map.get(type_key, type_key)
-            try:
-                generator.generate_object_block(code, ty_map, imports, opt, obj_info)
-            except UnsupportedTypeError as err:
-                # Fail closed for this object.  Leaving only its markers keeps
-                # the file deterministic and lets a later run regenerate it
-                # after the schema/runtime gains support.
-                code.lines = [code.lines[0], code.lines[-1]]
-                print(f"{C.TERM_YELLOW}[Skipped] object {type_key}: {err}{C.TERM_RESET}")
-                skipped_objects.append((type_key, str(err)))
-                continue
+            generator.generate_object_block(code, ty_map, imports, opt, obj_info)
             defined_types.add(generator.canonical_type_name(type_key))
     # Stage 4. Add imports for used types.
     for code in file.code_blocks:
@@ -390,9 +380,6 @@ def _stage_3(  # noqa: PLR0912
     for code in file.code_blocks:
         if code.kind == "export":
             generator.generate_export_block(code)
-    if skipped_objects and opt.strict:
-        details = "; ".join(f"{key}: {reason}" for key, reason in skipped_objects)
-        raise RuntimeError(f"strict generation rejected unsupported objects: {details}")
 
 
 def _parse_args() -> Options:
@@ -501,14 +488,6 @@ def _parse_args() -> Options:
         ),
     )
     parser.add_argument(
-        "--allow-partial",
-        action="store_true",
-        help=(
-            "Keep successfully generated bindings and return success when some reflected "
-            "constructs are unsupported. Strict failure is the default."
-        ),
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -542,7 +521,6 @@ def _parse_args() -> Options:
         verbose=args.verbose,
         dry_run=args.dry_run,
         target=args.target,
-        strict=not args.allow_partial,
     )
 
 

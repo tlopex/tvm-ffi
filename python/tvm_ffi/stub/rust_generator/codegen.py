@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import dataclasses
 import re
-import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -211,8 +210,7 @@ class _ObjectRenderer:
             f"#[type_key = {_rust_string_literal(self.info.type_key or '')}]",
             f"pub struct {obj_struct} {{",
             f"    base: {base_type},",
-            "    // Reflection does not prove C++ thread safety. Keep handles",
-            "    // !Send + !Sync until the schema can state that contract.",
+            "    // Reflection does not prove C++ thread safety.",
             "    _not_send_sync: PhantomData<Rc<()>>,",
             "}",
             "",
@@ -228,44 +226,24 @@ class _ObjectRenderer:
             lines += self._parent_deref_lines()
             lines += self._upcast_lines()
         lines += self._impl_block()
-        if self.info.has_init and not self._explicit_init_methods():
-            lines += self._constructor_builder_lines()
 
         lines.pop()  # every section above ends with a `""` separator
         return lines
 
-    def _ref_helper_lines(self) -> list[str]:
-        """Pointer identity and an owning, runtime-checked object-ref cast."""
-        self.imports.record("tvm_ffi::ObjectRefCore")
-        self.imports.record("tvm_ffi::ObjectRefCast")
-        self.imports.record("tvm_ffi::Result")
-        return [
-            "/// C++ `ObjectRef::same_as`: pointer identity of the underlying object.",
-            "pub fn same_as<O: tvm_ffi::ObjectRefCore>(&self, other: &O) -> bool {",
-            "    unsafe {",
-            "        ObjectArc::as_raw(&self.data) as *const u8",
-            "            == ObjectArc::as_raw(<O as tvm_ffi::ObjectRefCore>::data(other)) as *const u8",
-            "    }",
-            "}",
-            "",
-            "/// Checked object-ref cast using the runtime inheritance table.",
-            "pub fn downcast<B>(&self) -> Result<B>",
-            "where",
-            "    B: tvm_ffi::ObjectRefCore + tvm_ffi::AnyCompatible,",
-            "{",
-            "    self.clone().try_cast::<B>()",
-            "}",
-        ]
-
     def _impl_block(self) -> list[str]:
-        """Emit helpers, typed field getters, constructor, and methods."""
+        """Emit typed field getters, explicit constructors, and methods."""
+        explicit = self._explicit_init_methods()
+        if explicit and not self.info.has_init:
+            raise UnsupportedTypeError(
+                self.info.type_key or self.leaf,
+                "reflected __ffi_init__ exists but the object has no init metadata",
+            )
         methods = [
             m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"
         ]
 
-        sections: list[list[str]] = [self._ref_helper_lines()]
+        sections: list[list[str]] = []
         if self.info.has_init:
-            explicit = self._explicit_init_methods()
             if len(explicit) == 1:
                 sections.append(self._new_fn_explicit(explicit[0]))
             elif explicit:
@@ -273,14 +251,10 @@ class _ObjectRenderer:
                     self._new_fn_explicit(method, f"ffi_new_overload_{index}")
                     for index, method in enumerate(explicit, start=1)
                 ]
-            else:
-                sections.append(self._new_builder_fn())
 
-        reserved = {"same_as", "downcast", "ffi_new", "ffi_new_unchecked"}
-        reserved.update(
-            f"ffi_new_overload_{index}"
-            for index in range(1, len(self._explicit_init_methods()) + 1)
-        )
+        # Reflected members must not shadow ObjectRefCore/ObjectRefCast methods.
+        reserved = {"is_defined", "is_null", "same_as", "downcast", "try_cast", "ffi_new"}
+        reserved.update(f"ffi_new_overload_{index}" for index in range(1, len(explicit) + 1))
         method_names = self._method_names(methods, reserved)
         reserved.update(method_names)
         field_names = allocate_rust_names(
@@ -293,6 +267,9 @@ class _ObjectRenderer:
         sections += [
             self._method_fn(method, rust_name) for method, rust_name in zip(methods, method_names)
         ]
+
+        if not sections:
+            return []
 
         inner: list[str] = []
         for i, section in enumerate(sections):
@@ -321,12 +298,28 @@ class _ObjectRenderer:
         ]
 
     def _explicit_init_methods(self) -> list[FuncInfo]:
-        """Return explicitly reflected `__ffi_init__` methods."""
-        return [
+        """Validate and return canonical static `__ffi_init__` factories."""
+        methods = [
             method
             for method in self.info.methods
             if method.schema.name.rsplit(".", 1)[-1] == "__ffi_init__"
         ]
+        for method in methods:
+            args = _callable_schema_args(method)
+            if method.is_member or not args:
+                raise UnsupportedTypeError(
+                    self.info.type_key or self.leaf,
+                    "__ffi_init__ must be a typed static factory",
+                )
+            result = args[0]
+            while result.origin == "Optional":
+                (result,) = result.args
+            if result.origin != self.info.type_key:
+                raise UnsupportedTypeError(
+                    result.origin,
+                    f"__ffi_init__ for {self.info.type_key!r} returns {result.origin!r}",
+                )
+        return methods
 
     def _method_names(self, methods: list[FuncInfo], reserved: set[str]) -> list[str]:
         """Give overloads and helper collisions deterministic Rust names."""
@@ -391,97 +384,6 @@ class _ObjectRenderer:
             f"pub fn {_escape_ident(name)}({signature}) -> Result<{self.leaf}> {{",
             *_packed_call_lines("f", getter, packed, self.leaf),
             "}",
-        ]
-
-    def _new_builder_fn(self) -> list[str]:
-        """Start a named-field builder for reflection's unchecked auto-init path."""
-        builder = f"{self.leaf}Builder"
-        return [
-            "/// Start reflection-backed field initialization.",
-            "///",
-            "/// The eventual `build_unchecked` call may bypass semantic checks",
-            "/// performed by a canonical C++ wrapper constructor.",
-            f"pub fn ffi_new_unchecked() -> {builder} {{",
-            f"    {builder} {{",
-            *[f"        {_escape_ident(field.name)}: None," for field in self.info.init_fields],
-            "    }",
-            "}",
-        ]
-
-    def _constructor_builder_lines(self) -> list[str]:
-        """Build auto-init kwargs and call the reflected C++ `__ffi_init__`."""
-        builder = f"{self.leaf}Builder"
-        fields = self.info.init_fields
-        rendered = [(field, self.render_struct_field(field.schema)) for field in fields]
-        setter_names = allocate_rust_names(
-            [f"with_{_snake_case(field.name)}" for field in fields],
-            {"build_unchecked"},
-            collision_suffix="field",
-        )
-        self.imports.record("tvm_ffi::Any")
-        self.imports.record("tvm_ffi::AnyView")
-        self.imports.record("tvm_ffi::Result")
-
-        lines = [f"pub struct {builder} {{"]
-        for field, ty in rendered:
-            lines.append(f"    {_escape_ident(field.name)}: Option<{ty}>,")
-        lines += ["}", ""]
-
-        inner: list[str] = []
-        for (field, ty), setter in zip(rendered, setter_names):
-            name = _escape_ident(field.name)
-            inner += [
-                f"pub fn {setter}(mut self, value: {ty}) -> Self {{",
-                f"    self.{name} = Some(value);",
-                "    self",
-                "}",
-                "",
-            ]
-
-        inner += [
-            "/// Allocate through generic reflected field initialization.",
-            "///",
-            "/// # Safety",
-            "/// The caller must uphold semantic invariants normally enforced by",
-            "/// the type's canonical C++ constructor.",
-            f"pub unsafe fn build_unchecked(self) -> Result<{self.leaf}> {{",
-            *self._cached_getter_lines("f", "__ffi_init__"),
-            f"    let {'mut ' if fields else ''}owned_args: Vec<Any> = Vec::new();",
-        ]
-        if fields:
-            inner.append("    owned_args.push(Any::from(tvm_ffi::get_kwargs_object()?));")
-        for field, _ in rendered:
-            name = _escape_ident(field.name)
-            value_expr = f"self.{name}"
-            if not field.has_default:
-                value_expr += ".ok_or_else(|| tvm_ffi::Error::new("
-                message = _rust_string_literal(f"field `{field.name}` is not set")
-                value_expr += f'tvm_ffi::VALUE_ERROR, {message}, ""))?'
-                inner += self._push_kwarg_lines(field.name, value_expr, indent="    ")
-            else:
-                inner.append(f"    if let Some(value) = {value_expr} {{")
-                inner += self._push_kwarg_lines(field.name, "value", indent="        ")
-                inner.append("    }")
-        inner += [
-            "    let views: Vec<AnyView<'_>> = owned_args.iter().map(AnyView::from).collect();",
-            "    Ok(f.call_packed(&views)?.try_into()?)",
-            "}",
-        ]
-        lines += [
-            f"impl {builder} {{",
-            *[f"    {line}" if line else "" for line in inner],
-            "}",
-            "",
-        ]
-        return lines
-
-    @staticmethod
-    def _push_kwarg_lines(field_name: str, value: str, indent: str) -> list[str]:
-        """Append one key/value pair to an owning packed-argument vector."""
-        return [
-            f"{indent}owned_args.push(Any::from(tvm_ffi::String::from("
-            f"{_rust_string_literal(field_name)})));",
-            f"{indent}owned_args.push(Any::from({value}));",
         ]
 
     def _cached_getter_lines(self, fvar: str, ffi_name: str) -> list[str]:
@@ -558,11 +460,11 @@ def generate_rust_object(
     """Emit a Rust ``struct``/``impl`` binding for an ``object/<key>`` block.
 
     Emits an opaque ``<T>Obj`` prefix marker, the owning ``<T>`` ref wrapper,
-    safe reflection-backed field getters, reflected methods, explicit C++
-    constructors, and a clearly unsafe builder for generic field initialization.
+    safe reflection-backed field getters, reflected methods, and explicit C++
+    constructors. Generic reflected initialization is intentionally omitted:
+    field metadata does not prove constructor invariants.
     Raises :class:`UnsupportedTypeError` for types the crate cannot represent;
-    ``cli`` catches it and skips the block (any ``use``s already recorded are
-    harmless -- generated files allow unused imports).
+    generation is fail-closed, so no output is committed in that case.
     """
     assert len(code.lines) >= 2
     type_key = obj_info.type_key
@@ -685,23 +587,11 @@ def generate_rust_global_funcs(
     ]
     rust_names = allocate_rust_names(base_names, collision_suffix="global")
     rendered: list[str] = []
-    skipped: list[tuple[str, str]] = []
     for func, rust_name in zip(global_funcs, rust_names):
-        try:
-            section = _render_rust_global_func(func, rust_name, ty_render, imports)
-            if rendered:
-                rendered.append("")
-            rendered += section
-        except UnsupportedTypeError as err:
-            skipped.append((func.schema.name, str(err)))
-
-    if skipped:
-        details = "; ".join(f"{name}: {reason}" for name, reason in skipped)
-        if opt.strict:
-            raise RuntimeError(
-                f"strict generation rejected unsupported global functions: {details}"
-            )
-        warnings.warn(f"Rust stubgen skipped unsupported global functions: {details}", stacklevel=2)
+        section = _render_rust_global_func(func, rust_name, ty_render, imports)
+        if rendered:
+            rendered.append("")
+        rendered += section
 
     indent = " " * code.indent
     code.lines = [

@@ -155,6 +155,15 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
     fn is_null(&self) -> bool {
         ObjectArc::is_null(Self::data(self))
     }
+
+    /// Return whether two object references point to the same C++ object.
+    ///
+    /// This is C++ `ObjectRef::same_as`. Defining it on the core trait keeps
+    /// generated bindings free of one identical inherent method per type.
+    #[inline]
+    fn same_as<O: ObjectRefCore>(&self, other: &O) -> bool {
+        ObjectArc::ptr_eq(Self::data(self), O::data(other))
+    }
 }
 
 /// Check whether a runtime type index refers to `Target` or one of its
@@ -328,6 +337,15 @@ where
 /// This trait is blanket-implemented for every [`ObjectRefCore`] type that is
 /// also [`AnyCompatible`].
 pub trait ObjectRefCast: ObjectRefCore + AnyCompatible {
+    /// Borrow and clone `self`, then cast it to another object-ref type.
+    #[inline(always)]
+    fn downcast<B>(&self) -> crate::error::Result<B>
+    where
+        B: ObjectRefCore + AnyCompatible,
+    {
+        self.clone().try_cast()
+    }
+
     /// Consume `self` and rewrap the underlying object as `B` without copying.
     #[inline(always)]
     fn try_cast<B>(self) -> crate::error::Result<B>
@@ -536,6 +554,12 @@ unsafe impl ObjectCore for Object {
 //---------------------
 
 impl<T: ObjectCore> ObjectArc<T> {
+    /// Return whether two handles point to the same object allocation.
+    #[inline]
+    pub fn ptr_eq<U: ObjectCore>(this: &Self, other: &ObjectArc<U>) -> bool {
+        this.ptr.cast::<()>() == other.ptr.cast::<()>()
+    }
+
     pub fn new(data: T) -> Self {
         unsafe {
             let layout = std::alloc::Layout::new::<T>();

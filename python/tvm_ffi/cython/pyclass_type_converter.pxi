@@ -761,6 +761,11 @@ def _build_converter(schema):
         conv.subs = tuple(<_TypeConverter>(a._converter) for a in args)
         conv.err_hint = " | ".join(repr(a) for a in args)
         return conv
+    if origin == "TypedExpr":
+        # Python exposes the underlying Expr class.  Preserve that wire
+        # representation here; the C++ TypedExpr TypeTraits validates the
+        # reflected result type at the receiving boundary.
+        return args[0]._converter
 
     if origin == "int":
         conv.dispatch = _tc_convert_int

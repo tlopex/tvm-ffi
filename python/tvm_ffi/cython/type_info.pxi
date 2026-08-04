@@ -192,12 +192,21 @@ class TypeSchema:
                 raise ValueError(f"{origin} must have 0 or 2 arguments")
             if args == ():
                 self.args = (TypeSchema("Any"), TypeSchema("Any"))
+        elif origin == "TypedExpr":
+            if len(args) != 2:
+                raise ValueError("TypedExpr must have exactly two arguments")
         elif origin == "tuple":
             pass  # tuple can have arbitrary number of arguments
         # Compute origin_type_index if not already set
         if self.origin_type_index == _ORIGIN_TYPE_INDEX_UNKNOWN:
             if origin in ("Optional", "Union"):
                 self.origin_type_index = _ORIGIN_TYPE_INDEX_STRUCTURAL
+            elif origin == "TypedExpr":
+                # TypedExpr refines an object using semantic information that
+                # Python cannot encode in its class hierarchy.  Its runtime
+                # representation and Python-facing type remain the base object;
+                # the receiving C++ TypeTraits performs the refinement check.
+                self.origin_type_index = args[0].origin_type_index
             elif origin in _ORIGIN_TO_TYPE_INDEX:
                 self.origin_type_index = _ORIGIN_TO_TYPE_INDEX[origin]
             else:
@@ -583,8 +592,13 @@ class TypeSchema:
                         expanded_convert_types=expanded_convert_types | {self.origin_type_index},
                     )
 
-        origin = self.origin if ty_map is None else ty_map(self.origin)
         schema_args = self.args
+        if self.origin == "TypedExpr":
+            return schema_args[0]._repr_impl(
+                ty_map, input_mode, expanded_convert_types
+            )
+
+        origin = self.origin if ty_map is None else ty_map(self.origin)
         args = [
             i._repr_impl(ty_map, input_mode, expanded_convert_types)
             for i in (() if schema_args is None else schema_args)
