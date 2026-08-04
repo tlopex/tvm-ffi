@@ -452,14 +452,24 @@ where
     }
 
     unsafe fn copy_to_any_view(src: &Self, data: &mut TVMFFIAny) {
+        let ptr = ObjectArc::as_raw(Self::data(src));
+        if ptr.is_null() {
+            *data = TVMFFIAny::new();
+            return;
+        }
         data.type_index = TypeIndex::kTVMFFIMap as i32;
-        data.data_union.v_obj = ObjectArc::as_raw(Self::data(src)) as *mut TVMFFIObject;
+        data.data_union.v_obj = ptr as *mut TVMFFIObject;
         data.small_str_len = 0;
     }
 
     unsafe fn move_to_any(src: Self, data: &mut TVMFFIAny) {
+        let ptr = ObjectArc::into_raw(Self::into_data(src));
+        if ptr.is_null() {
+            *data = TVMFFIAny::new();
+            return;
+        }
         data.type_index = TypeIndex::kTVMFFIMap as i32;
-        data.data_union.v_obj = ObjectArc::into_raw(Self::into_data(src)) as *mut TVMFFIObject;
+        data.data_union.v_obj = ptr as *mut TVMFFIObject;
         data.small_str_len = 0;
     }
 

@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use tvm_ffi::collections::map::MapObj;
 use tvm_ffi::*;
 
 /// Helper to create a CPU `f32` tensor whose first element is `val`.
@@ -62,6 +63,21 @@ fn test_map_empty() {
     assert_eq!(map.iter().count(), 0);
     assert_eq!(map.keys().count(), 0);
     assert_eq!(map.values().count(), 0);
+}
+
+#[test]
+fn test_null_map_encodes_as_ffi_none() {
+    let map = <Map<i64, i64> as ObjectRefCore>::from_data(unsafe {
+        ObjectArc::<MapObj>::from_raw(std::ptr::null())
+    });
+    assert_eq!(
+        Any::from(map.clone()).type_index(),
+        TypeIndex::kTVMFFINone as i32
+    );
+    assert_eq!(
+        AnyView::from(&map).type_index(),
+        TypeIndex::kTVMFFINone as i32
+    );
 }
 
 /// `FromIterator` follows C++ `ffi.Map` last-wins semantics for duplicate keys,

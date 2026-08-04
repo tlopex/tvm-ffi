@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use tvm_ffi::collections::array::ArrayObj;
 use tvm_ffi::*;
 
 /// Helper to create a Tensor with a specific float value and shape
@@ -76,6 +77,21 @@ fn test_array_any_conversions() {
     let view = AnyView::from(&back);
     let back_from_view: Array<Tensor> = Array::try_from(view).expect("AnyView -> Array failed");
     assert_eq!(back_from_view.len(), 3);
+}
+
+#[test]
+fn test_null_array_encodes_as_ffi_none() {
+    let array = <Array<i64> as ObjectRefCore>::from_data(unsafe {
+        ObjectArc::<ArrayObj>::from_raw(std::ptr::null())
+    });
+    assert_eq!(
+        Any::from(array.clone()).type_index(),
+        TypeIndex::kTVMFFINone as i32
+    );
+    assert_eq!(
+        AnyView::from(&array).type_index(),
+        TypeIndex::kTVMFFINone as i32
+    );
 }
 
 #[test]

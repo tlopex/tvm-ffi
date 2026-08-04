@@ -197,6 +197,10 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                 let data_ptr = #tvm_ffi_crate::object::ObjectArc::<ContainerType>::as_raw(
                     &src.data
                 );
+                if data_ptr.is_null() {
+                    *data = #tvm_ffi_crate::tvm_ffi_sys::TVMFFIAny::new();
+                    return;
+                }
                 let object_ptr =
                     data_ptr as *mut ContainerType as *mut #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject;
                 data.type_index = (*object_ptr).type_index;
@@ -241,6 +245,10 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                 let data_ptr = #tvm_ffi_crate::object::ObjectArc::into_raw(
                     src.data
                 );
+                if data_ptr.is_null() {
+                    *data = #tvm_ffi_crate::tvm_ffi_sys::TVMFFIAny::new();
+                    return;
+                }
                 let object_ptr =
                     data_ptr as *mut ContainerType as *mut #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject;
                 data.type_index = (*object_ptr).type_index;

@@ -18,6 +18,8 @@
  */
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tvm_ffi::object::ObjectRef;
+use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex;
 use tvm_ffi::*;
 
 // must have repr(C) for the object header stays in the same position
@@ -140,9 +142,26 @@ fn test_object_arc_from_raw() {
 }
 
 #[test]
-fn test_object_arc_option_size() {
+fn test_object_arc_nullable_representation() {
     assert_eq!(
-        std::mem::size_of::<Option<ObjectArc<TestIntObj>>>(),
-        std::mem::size_of::<ObjectArc<TestIntObj>>()
+        std::mem::size_of::<ObjectArc<TestIntObj>>(),
+        std::mem::size_of::<*const TestIntObj>()
     );
+
+    let null_arc = unsafe { ObjectArc::<TestIntObj>::from_raw(std::ptr::null()) };
+    assert!(ObjectArc::is_null(&null_arc));
+    assert_eq!(ObjectArc::strong_count(&null_arc), 0);
+    assert_eq!(ObjectArc::weak_count(&null_arc), 0);
+    let null_clone = null_arc.clone();
+    assert!(ObjectArc::is_null(&null_clone));
+    assert!(std::panic::catch_unwind(|| std::hint::black_box(&*null_clone)).is_err());
+    drop(null_arc);
+    drop(null_clone);
+
+    let null_ref = <ObjectRef as ObjectRefCore>::from_data(unsafe {
+        ObjectArc::<Object>::from_raw(std::ptr::null())
+    });
+    let null_any = Any::from(null_ref.clone());
+    assert_eq!(null_any.type_index(), TVMFFITypeIndex::kTVMFFINone as i32);
+    assert!(AnyView::from(&null_ref).try_as::<ObjectRef>().is_none());
 }

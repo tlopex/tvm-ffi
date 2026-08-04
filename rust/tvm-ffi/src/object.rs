@@ -32,12 +32,21 @@ pub struct Object {
     header: TVMFFIObject,
 }
 
-/// Arc-like wrapper for Object that allows shared ownership
+/// Arc-like wrapper for Object that allows shared ownership.
+///
+/// Its single pointer slot may be null to mirror a nullable C++ `ObjectRef`
+/// field in place. Cloning and dropping null are no-ops; dereferencing null
+/// panics before a Rust reference is formed.
 ///
 /// \tparam T The type of the object to be wrapped
 #[repr(C)]
 pub struct ObjectArc<T: ObjectCore> {
-    ptr: std::ptr::NonNull<T>,
+    // C++ ObjectRef uses a nullable pointer slot.  Top-level handles returned
+    // as concrete values are normally defined, but the same Rust wrapper also
+    // appears in generated in-place object layouts where null is a valid field
+    // value (most notably Span and Attrs).  A raw pointer preserves that ABI
+    // without asserting NonNull before the field is actually dereferenced.
+    ptr: *mut T,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -110,17 +119,18 @@ pub unsafe trait ObjectCoreWithExtraItems: ObjectCore {
 ///
 /// # Safety
 ///
-/// `data`, `into_data`, and `from_data` must preserve the same object
-/// allocation and form an ownership-preserving round trip. That allocation must
-/// start with a valid `TVMFFIObject` header whose registered object-range
-/// runtime type index correctly describes its layout and inheritance.
+/// `data`, `into_data`, and `from_data` must preserve the same object pointer
+/// and form an ownership-preserving round trip. A non-null allocation must start
+/// with a valid `TVMFFIObject` header whose registered object-range runtime type
+/// index correctly describes its layout and inheritance. A null pointer is the
+/// C++ nullable-ObjectRef representation and owns no reference.
 ///
 /// When `Self` also implements [`AnyCompatible`], `copy_to_any_view` must
 /// produce a non-owning view, while `move_to_any` must transfer ownership of
-/// the same object pointer and dynamic type index. `move_from_any_after_check`
-/// must be able to reclaim that owned representation exactly once, and a true
-/// `check_any_strict` result must guarantee that both after-check constructors
-/// are valid for it.
+/// the same object pointer and dynamic type index (or FFI None for null).
+/// `move_from_any_after_check` must be able to reclaim a defined owned
+/// representation exactly once, and a true `check_any_strict` result must
+/// guarantee that both after-check constructors are valid for it.
 pub unsafe trait ObjectRefCore: Sized + Clone {
     type ContainerType: ObjectCore;
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType>;
@@ -191,12 +201,6 @@ pub trait ObjectRefCast: ObjectRefCore + AnyCompatible {
             // the failure and panic paths unwind normally instead of stranding
             // an owned object inside a raw TVMFFIAny.
             Self::copy_to_any_view(&self, &mut any_data);
-            debug_assert!(any_data.type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32);
-            // SAFETY: ObjectRefCore's contract requires its AnyCompatible
-            // representation to contain a valid object-range type index.
-            std::hint::assert_unchecked(
-                any_data.type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32,
-            );
 
             if B::check_any_strict(&any_data) {
                 // Transfer ownership only after the borrowed representation has
@@ -414,7 +418,7 @@ impl<T: ObjectCore> ObjectArc<T> {
             );
             // move into the object arc ptr
             Self {
-                ptr: std::ptr::NonNull::new_unchecked(ptr as *mut T),
+                ptr,
                 _phantom: std::marker::PhantomData,
             }
         }
@@ -452,7 +456,7 @@ impl<T: ObjectCore> ObjectArc<T> {
             );
             // move into the object arc ptr
             Self {
-                ptr: std::ptr::NonNull::new_unchecked(ptr as *mut T),
+                ptr,
                 _phantom: std::marker::PhantomData,
             }
         }
@@ -469,7 +473,7 @@ impl<T: ObjectCore> ObjectArc<T> {
     #[inline]
     pub unsafe fn from_raw(ptr: *const T) -> Self {
         Self {
-            ptr: std::ptr::NonNull::new_unchecked(ptr as *mut T),
+            ptr: ptr as *mut T,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -484,7 +488,7 @@ impl<T: ObjectCore> ObjectArc<T> {
     #[inline]
     pub unsafe fn into_raw(this: Self) -> *const T {
         let droped_this = std::mem::ManuallyDrop::new(this);
-        droped_this.ptr.as_ptr() as *const T
+        droped_this.ptr as *const T
     }
 
     /// Get the raw pointer from the ObjectArc
@@ -499,7 +503,7 @@ impl<T: ObjectCore> ObjectArc<T> {
     /// \return The raw pointer
     #[inline]
     pub unsafe fn as_raw(this: &Self) -> *const T {
-        this.ptr.as_ptr() as *const T
+        this.ptr as *const T
     }
 
     /// Get the raw mutable pointer from the ObjectArc
@@ -513,7 +517,13 @@ impl<T: ObjectCore> ObjectArc<T> {
     /// * `*mut T` - The raw pointer
     #[inline]
     pub unsafe fn as_raw_mut(this: &mut Self) -> *mut T {
-        this.ptr.as_mut()
+        this.ptr
+    }
+
+    /// Return whether this is C++'s null ObjectRef representation.
+    #[inline]
+    pub fn is_null(this: &Self) -> bool {
+        this.ptr.is_null()
     }
 
     /// Get the strong reference count of the ObjectArc
@@ -525,8 +535,10 @@ impl<T: ObjectCore> ObjectArc<T> {
     /// * `usize` - The strong reference count
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
-        unsafe {
-            unsafe_::strong_count(this.ptr.as_ref() as *const T as *mut T as *mut TVMFFIObject)
+        if this.ptr.is_null() {
+            0
+        } else {
+            unsafe { unsafe_::strong_count(this.ptr.cast::<TVMFFIObject>()) }
         }
     }
 
@@ -539,7 +551,11 @@ impl<T: ObjectCore> ObjectArc<T> {
     /// * `usize` - The weak reference count
     #[inline]
     pub fn weak_count(this: &Self) -> usize {
-        unsafe { unsafe_::weak_count(this.ptr.as_ref() as *const T as *mut T as *mut TVMFFIObject) }
+        if this.ptr.is_null() {
+            0
+        } else {
+            unsafe { unsafe_::weak_count(this.ptr.cast::<TVMFFIObject>()) }
+        }
     }
 }
 
@@ -548,7 +564,11 @@ impl<T: ObjectCore> Deref for ObjectArc<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        unsafe { self.ptr.as_ref() }
+        assert!(
+            !self.ptr.is_null(),
+            "attempted to dereference a null TVM ObjectRef"
+        );
+        unsafe { &*self.ptr }
     }
 }
 
@@ -556,14 +576,20 @@ impl<T: ObjectCore> Deref for ObjectArc<T> {
 impl<T: ObjectCore> DerefMut for ObjectArc<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.ptr.as_mut() }
+        assert!(
+            !self.ptr.is_null(),
+            "attempted to mutably dereference a null TVM ObjectRef"
+        );
+        unsafe { &mut *self.ptr }
     }
 }
 
 // implement Drop for ObjectArc
 impl<T: ObjectCore> Drop for ObjectArc<T> {
     fn drop(&mut self) {
-        unsafe { unsafe_::dec_ref(self.ptr.as_mut() as *mut T as *mut TVMFFIObject) }
+        if !self.ptr.is_null() {
+            unsafe { unsafe_::dec_ref(self.ptr.cast::<TVMFFIObject>()) }
+        }
     }
 }
 
@@ -571,7 +597,9 @@ impl<T: ObjectCore> Drop for ObjectArc<T> {
 impl<T: ObjectCore> Clone for ObjectArc<T> {
     #[inline]
     fn clone(&self) -> Self {
-        unsafe { unsafe_::inc_ref(self.ptr.as_ref() as *const T as *mut T as *mut TVMFFIObject) }
+        if !self.ptr.is_null() {
+            unsafe { unsafe_::inc_ref(self.ptr.cast::<TVMFFIObject>()) }
+        }
         Self {
             ptr: self.ptr,
             _phantom: std::marker::PhantomData,
