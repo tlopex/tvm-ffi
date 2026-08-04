@@ -70,7 +70,8 @@ fn test_null_map_encodes_as_ffi_none() {
     let map = <Map<i64, i64> as ObjectRefCore>::from_data(unsafe {
         ObjectArc::<MapObj>::from_raw(std::ptr::null())
     });
-    assert!(std::panic::catch_unwind(|| map.len()).is_err());
+    assert_eq!(map.len(), 0);
+    assert!(map.is_empty());
     assert_eq!(
         Any::from(map.clone()).type_index(),
         TypeIndex::kTVMFFINone as i32

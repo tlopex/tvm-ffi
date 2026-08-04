@@ -49,9 +49,13 @@ fn test_array_core_and_iteration() {
     assert!(!array.is_empty());
 
     // Value Integrity
-    assert_eq!(get_val(&Tensor::try_from(array[0]).unwrap()), 10.0);
-    assert_eq!(Tensor::try_from(array[0]).unwrap().ndim(), 2);
-    assert_eq!(Tensor::try_from(array[1]).unwrap().ndim(), 3);
+    assert_eq!(get_val(&array.get(0).unwrap()), 10.0);
+    assert_eq!(array.get(0).unwrap().ndim(), 2);
+    assert_eq!(array.get(1).unwrap().ndim(), 3);
+    assert_eq!(
+        get_val(&Tensor::try_from(array.get_any(0).unwrap()).unwrap()),
+        10.0
+    );
 
     // Iteration
     let vals: Vec<f32> = array.iter().map(|t| get_val(&t)).collect();
@@ -84,7 +88,10 @@ fn test_null_array_encodes_as_ffi_none() {
     let array = <Array<i64> as ObjectRefCore>::from_data(unsafe {
         ObjectArc::<ArrayObj>::from_raw(std::ptr::null())
     });
-    assert!(std::panic::catch_unwind(|| array.len()).is_err());
+    assert_eq!(array.len(), 0);
+    assert!(array.is_empty());
+    assert!(array.get(0).is_err());
+    assert!(array.get_any(0).is_err());
     assert_eq!(
         Any::from(array.clone()).type_index(),
         TypeIndex::kTVMFFINone as i32

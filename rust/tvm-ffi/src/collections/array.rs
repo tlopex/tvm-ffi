@@ -125,7 +125,11 @@ impl<T: AnyCompatible + Clone> Array<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.data.size as usize
+        if self.is_null() {
+            0
+        } else {
+            self.data.size as usize
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -154,37 +158,27 @@ impl<T: AnyCompatible + Clone> Array<T> {
         }
     }
 
+    /// Borrow an element without extending its lifetime beyond this array.
+    ///
+    /// Unlike the former `Index` implementation, the returned view cannot be
+    /// copied out and used after the array (which owns object-valued elements)
+    /// has been dropped.
+    pub fn get_any(&self, index: usize) -> Result<AnyView<'_>, crate::Error> {
+        if index >= self.len() {
+            crate::bail!(crate::error::INDEX_ERROR, "Array get index out of bound");
+        }
+        unsafe {
+            let container = self.data.deref();
+            let base_ptr = container.data as *const TVMFFIAny;
+            Ok(AnyView::from_raw_ffi_any(*base_ptr.add(index)))
+        }
+    }
+
     pub fn iter(&'_ self) -> ArrayIterator<'_, T> {
         ArrayIterator {
             array: self,
             index: 0,
             len: self.len(),
-        }
-    }
-
-    #[inline]
-    fn as_container(&self) -> &ArrayObj {
-        self.data.deref()
-    }
-}
-
-// --- Index Implementation ---
-
-impl<T: AnyCompatible + Clone> std::ops::Index<usize> for Array<T> {
-    type Output = AnyView<'static>;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        let container = self.as_container();
-        let len = container.size as usize;
-        if index >= len {
-            panic!(
-                "Index out of bounds: the len is {} but the index is {}",
-                len, index
-            );
-        }
-        unsafe {
-            let ptr = (container.data as *const AnyView<'static>).add(index);
-            &*ptr
         }
     }
 }

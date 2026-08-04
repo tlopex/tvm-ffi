@@ -141,7 +141,11 @@ where
     /// Returns the number of entries in the map by reading the `MapObj` header
     /// directly (no FFI call), like [`Array::len`](crate::Array).
     pub fn len(&self) -> usize {
-        self.size as usize
+        if self.is_null() {
+            0
+        } else {
+            self.size as usize
+        }
     }
 
     /// Returns `true` if the map contains no entries.
