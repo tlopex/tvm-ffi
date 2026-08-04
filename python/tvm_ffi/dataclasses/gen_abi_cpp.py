@@ -208,6 +208,7 @@ def _validate_native_schema(schema: TypeSchema, raw: dict[str, object]) -> None:
         "tuple": "Tuple",
         "Optional": "Optional",
         "Union": "Variant",
+        "TypedExpr": "TypedExpr",
     }
     expected_raw_origin = structural_origins.get(origin)
     if expected_raw_origin is not None:
@@ -324,6 +325,8 @@ class _Generator:
         return _cpp_name(info.type_key).qualified
 
     def _lower_object(self, schema: TypeSchema) -> _Carrier:
+        if schema.origin == "TypedExpr":
+            return self._lower_object(schema.args[0])
         type_index = schema.origin_type_index
         if type_index == _OBJECT_TYPE_INDEX or schema.origin == "Object":
             return _Carrier("::tvm::ffi::Arc<::tvm::ffi::Object>", 8, 8)
@@ -340,6 +343,8 @@ class _Generator:
         return _Carrier(f"::tvm::ffi::Arc<{object_type}>", 8, 8)
 
     def _lower_nullable_object(self, schema: TypeSchema) -> _Carrier:
+        if schema.origin == "TypedExpr":
+            return self._lower_nullable_object(schema.args[0])
         type_index = schema.origin_type_index
         if type_index == _OBJECT_TYPE_INDEX or schema.origin == "Object":
             object_type = "::tvm::ffi::Object"

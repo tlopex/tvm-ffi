@@ -931,6 +931,44 @@ def test_native_object_carriers_preserve_schema_nullability() -> None:
     )
 
 
+def test_typed_expr_carriers_use_base_object_layout() -> None:
+    base_schema = {"type": "testing.gen_abi_cpp.Dependency"}
+    typed_schema = {
+        "type": "TypedExpr",
+        "args": [base_schema, {"type": "testing.gen_abi_cpp.other.Sibling"}],
+    }
+    optional_schema = {"type": "Optional", "args": [typed_schema]}
+    array_schema = {"type": "ffi.Array", "args": [typed_schema]}
+    owner = cast(
+        TypeInfo,
+        SimpleNamespace(type_key="testing.gen_abi_cpp.NativeTypedExprCarriers"),
+    )
+
+    def lower(name: str, raw_schema: dict[str, object], size: int) -> str:
+        field = cast(
+            TypeField,
+            SimpleNamespace(
+                name=name,
+                size=size,
+                alignment=8,
+                offset=24,
+                field_static_type_index=128,
+                ty=TypeSchema.from_json_obj(raw_schema),
+                metadata={"type_schema": raw_schema},
+            ),
+        )
+        return _Generator([])._lower_field(field, owner).cpp_type
+
+    object_type = "::testing::gen_abi_cpp::DependencyObj"
+    assert lower("required", typed_schema, 8) == f"::tvm::ffi::Arc<{object_type}>"
+    assert lower("nullable", optional_schema, 8) == f"::tvm::ffi::ObjectPtr<{object_type}>"
+    assert (
+        lower("optional", optional_schema, 16)
+        == f"::tvm::ffi::Optional<::tvm::ffi::Arc<{object_type}>>"
+    )
+    assert lower("array", array_schema, 8) == f"::tvm::ffi::Array<::tvm::ffi::Arc<{object_type}>>"
+
+
 def test_non_null_object_union_uses_arc_carrier() -> None:
     raw_schema = {
         "type": "Variant",
