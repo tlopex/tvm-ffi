@@ -118,7 +118,9 @@ impl Error {
     /// # Returns
     /// The kind of the error
     pub fn kind(&self) -> ErrorKind<'_> {
-        ErrorKind(&self.data.cell.kind.as_str())
+        // SAFETY: Error owns the native ErrorObj, whose ABI contract keeps its
+        // UTF-8 error-cell strings alive for the lifetime of that object.
+        ErrorKind(unsafe { self.data.cell.kind.as_str() })
     }
 
     /// Get the message of the error
@@ -126,7 +128,8 @@ impl Error {
     /// # Returns
     /// The message of the error
     pub fn message(&self) -> &str {
-        self.data.cell.message.as_str()
+        // SAFETY: See `kind`; this borrow is bounded by the owning Error.
+        unsafe { self.data.cell.message.as_str() }
     }
 
     /// Get the backtrace of the error
@@ -134,7 +137,8 @@ impl Error {
     /// # Returns
     /// The backtrace of the error
     pub fn backtrace(&self) -> &str {
-        self.data.cell.backtrace.as_str()
+        // SAFETY: See `kind`; this borrow is bounded by the owning Error.
+        unsafe { self.data.cell.backtrace.as_str() }
     }
 
     /// Get the traceback of the error in the order of most recent call last

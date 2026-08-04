@@ -16,8 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use tvm_ffi_sys::TVMFFIAny;
 use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
-use tvm_ffi_sys::{TVMFFIAny, TVMFFIGetTypeInfo};
 
 //-----------------------------------------------------
 // AnyCompatible
@@ -60,11 +60,7 @@ pub unsafe trait AnyCompatible: Sized {
     unsafe fn try_cast_from_any_view(data: &TVMFFIAny) -> Result<Self, ()>;
     /// Get the type key of a type when TryCastFromAnyView fails.
     fn get_mismatch_type_info(data: &TVMFFIAny) -> String {
-        unsafe {
-            let info = TVMFFIGetTypeInfo(data.type_index);
-            assert!(!info.is_null(), "TVMFFIGetTypeInfo returned null");
-            (*info).type_key.as_str().to_string()
-        }
+        crate::object::type_key_or_index(data.type_index)
     }
     /// the type string of the type
     fn type_str() -> String;

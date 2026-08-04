@@ -18,13 +18,10 @@
  */
 //! Immutable [`Map`] container backed by the C++ `ffi.Map` object.
 //!
-//! The `MapObj` header mirrors C++ `MapBaseObj`, so [`Map::len`] reads `size`
-//! directly (no FFI). The hash-table storage itself is an implementation detail,
-//! so lookups and iteration are delegated to the global functions the C++ runtime
-//! registers (`ffi.MapGetItem`, `ffi.MapForwardIterFunctor`, ...): there is no
-//! Map-specific C ABI, and a Rust re-implementation would have to replicate the
-//! hashing (`AnyHash`/`AnyEqual`) and dense/small probing, just as the Python
-//! bindings also delegate.
+//! C++ owns both the `MapBaseObj` header and its small/dense hash-table storage.
+//! Rust treats them as opaque and delegates size, lookup, and iteration to the
+//! public packed functions (`ffi.MapSize`, `ffi.MapGetItem`,
+//! `ffi.MapForwardIterFunctor`, ...).
 //!
 //! `Any` conversions follow C++ `MapTypeTraitsBase` (map_base.h): the strict
 //! check walks every entry, and a failed strict `try_from` falls back to
@@ -41,30 +38,15 @@ use crate::{Any, AnyCompatible, AnyView, Error, ObjectRefCore, Result};
 use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi_sys::{TVMFFIAny, TVMFFIObject};
 
-/// Container object for [`Map`]. The header fields mirror C++ `MapBaseObj`
-/// (`include/tvm/ffi/container/map_base.h`) so [`Map::len`] can read `size`
-/// without an FFI call; the storage `data` points to stays opaque.
-///
-/// This is a partial mirror by design: `MapBaseObj` has one more trailing field
-/// after `slots_` (a `data_deleter_` function pointer), omitted here because this
-/// binding is read-only — it only reads fields up to `size`, which precede it,
-/// and never allocates a `MapObj` itself (the C++ runtime allocates the larger
-/// `Small`/`DenseMapBaseObj` subclass), so the trailing field is never touched.
-/// The layout also assumes `TVM_FFI_DEBUG_WITH_ABI_CHANGE` is off (the default):
-/// with that debug flag set, `MapBaseObj` gains a *leading* `state_marker` field
-/// that would shift every offset below.
+/// Opaque container object for [`Map`]. Only the stable [`Object`] header is
+/// represented in Rust; all `MapBaseObj` fields are private C++ implementation
+/// details.
 #[repr(C)]
 #[derive(Object)]
 #[type_key = "ffi.Map"]
 #[type_index(TypeIndex::kTVMFFIMap)]
 pub struct MapObj {
     pub object: Object,
-    /// Pointer to the (opaque) key/value storage region (`MapBaseObj::data_`).
-    pub data: *mut core::ffi::c_void,
-    /// Number of entries (`MapBaseObj::size_`).
-    pub size: u64,
-    /// Number of hash slots; the MSB is a small-map tag (`MapBaseObj::slots_`).
-    pub slots: u64,
 }
 
 /// Immutable, reference-counted map from `K` to `V`, sharing its underlying
@@ -105,9 +87,8 @@ unsafe impl<K, V> ObjectRefCore for Map<K, V> {
     }
 }
 
-// A `Map<K, V>` is a counted handle to its `MapObj`, so it derefs to it (like
-// `ObjectArc` does): methods can read header fields as `self.size` instead of
-// `self.data.size`.
+// A `Map<K, V>` is a counted handle to its opaque `MapObj`, so it derefs to it
+// like `ObjectArc` does.
 impl<K, V> Deref for Map<K, V> {
     type Target = MapObj;
     #[inline]
@@ -138,14 +119,25 @@ where
         Self::try_from(result)
     }
 
-    /// Returns the number of entries in the map by reading the `MapObj` header
-    /// directly (no FFI call), like [`Array::len`](crate::Array).
+    /// Returns the number of entries in the map through the public C++ API.
     pub fn len(&self) -> usize {
+        self.try_len().expect("ffi.MapSize call failed")
+    }
+
+    fn try_len(&self) -> Result<usize> {
         if self.is_null() {
-            0
-        } else {
-            self.size as usize
+            return Ok(0);
         }
+        let size = crate::cached_global_func!("ffi.MapSize")
+            .call_packed(&[AnyView::from(self)])
+            .and_then(i64::try_from)?;
+        usize::try_from(size).map_err(|_| {
+            Error::new(
+                crate::error::VALUE_ERROR,
+                "ffi.MapSize returned an invalid size",
+                "",
+            )
+        })
     }
 
     /// Returns `true` if the map contains no entries.
@@ -270,8 +262,8 @@ where
     /// `try_cast_from_any_view`, which run during argument decoding where a
     /// panic could unwind across the C ABI.
     fn try_raw_entries(&self) -> Result<Vec<(Any, Any)>> {
-        let mut entries = Vec::with_capacity(self.len());
-        let mut remaining = self.len();
+        let mut remaining = self.try_len()?;
+        let mut entries = Vec::with_capacity(remaining);
         if remaining == 0 {
             return Ok(entries);
         }

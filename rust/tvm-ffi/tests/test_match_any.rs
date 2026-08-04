@@ -17,10 +17,7 @@
  * under the License.
  */
 
-use std::any::TypeId;
-
-use tvm_ffi::match_any_internal::{ArmId, LeafLookupTable, LeafPatternMetadata, LeafPatternProbe};
-use tvm_ffi::{match_any, Any, AnyView, Array, Function, Map, Module, Shape, Tensor, TypeIndex};
+use tvm_ffi::{match_any, Any, AnyView, Array, Function, Map, Module, Shape, Tensor};
 
 struct CustomModuleMatcher;
 
@@ -108,55 +105,4 @@ fn parameterized_containers_use_complete_conversion_semantics() {
     };
 
     assert_eq!(selected, "float array");
-}
-
-#[test]
-fn direct_lookup_table_maps_runtime_indices_to_local_arm_ids() {
-    const ARM_0: ArmId = 0;
-    const ARM_2: ArmId = 2;
-    let pattern_list_id = TypeId::of::<(i32, i64, f32)>();
-    let object_begin = TypeIndex::kTVMFFIStaticObjectBegin as i32;
-    let table = LeafLookupTable::build(
-        pattern_list_id,
-        &[object_begin + 4, object_begin + 4, object_begin + 7],
-    );
-
-    assert_eq!(table.lookup(pattern_list_id, object_begin + 3), Ok(None));
-    assert_eq!(
-        table.lookup(pattern_list_id, object_begin + 4),
-        Ok(Some(ARM_0))
-    );
-    assert_eq!(table.lookup(pattern_list_id, object_begin + 5), Ok(None));
-    assert_eq!(
-        table.lookup(pattern_list_id, object_begin + 7),
-        Ok(Some(ARM_2))
-    );
-    assert_eq!(table.lookup(pattern_list_id, object_begin + 8), Ok(None));
-    assert_eq!(
-        table.lookup(TypeId::of::<(u8, u16)>(), object_begin + 4),
-        Err(())
-    );
-}
-
-#[test]
-fn metadata_only_accepts_exact_leaf_patterns() {
-    type Leaf = (Module, ());
-    let leaf = LeafPatternProbe::<Leaf>::new();
-    let mut type_indices = [0; 1];
-    assert!((&leaf).leaf_pattern_list_id().is_some());
-    (&leaf).fill_leaf_type_indices(&mut type_indices);
-    assert!(type_indices[0] >= TypeIndex::kTVMFFIStaticObjectBegin as i32);
-
-    type Parameterized = (Array<i64>, ());
-    let parameterized = LeafPatternProbe::<Parameterized>::new();
-    assert!((&parameterized).leaf_pattern_list_id().is_none());
-
-    type NonFinal = (Tensor, ());
-    let non_final = LeafPatternProbe::<NonFinal>::new();
-    assert!((&non_final).leaf_pattern_list_id().is_none());
-
-    struct NoAnyCompatibleMetadata;
-    type Custom = (NoAnyCompatibleMetadata, ());
-    let custom = LeafPatternProbe::<Custom>::new();
-    assert!((&custom).leaf_pattern_list_id().is_none());
 }

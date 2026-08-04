@@ -209,6 +209,32 @@ impl Any {
         }
     }
 
+    /// Consume this value using only the reflected type's exact compatibility
+    /// rule, without invoking conversion fallbacks.
+    ///
+    /// This is the appropriate boundary for generated wrappers whose native
+    /// schema promises a concrete return type. Use `TryFrom<Any>` when an API
+    /// intentionally accepts coercions such as integer widening.
+    #[inline]
+    pub fn try_into_strict<T>(self) -> Result<T, Error>
+    where
+        T: AnyCompatible,
+    {
+        unsafe {
+            if T::check_any_strict(&self.data) {
+                let mut this = std::mem::ManuallyDrop::new(self);
+                Ok(T::move_from_any_after_check(&mut this.data))
+            } else {
+                let message = format!(
+                    "Cannot extract reflected type `{}` as `{}`",
+                    T::get_mismatch_type_info(&self.data),
+                    T::type_str()
+                );
+                Err(Error::new(crate::error::TYPE_ERROR, &message, ""))
+            }
+        }
+    }
+
     #[inline]
     pub unsafe fn as_data_ptr(&mut self) -> *mut TVMFFIAny {
         &mut self.data

@@ -47,26 +47,31 @@ fn update_ld_library_path(lib_dir: &str) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=TVM_FFI_LIB_DIR");
     // When building documentation, we may not need actual linking
     // Check if this is a rustdoc build
     let is_rustdoc = env::var("RUSTDOC").is_ok() || env::var("CARGO_CFG_DOC").is_ok();
 
-    // Run `mylib-config --libdir` to get the library path
-    let config_result = Command::new("tvm-ffi-config").arg("--libdir").output();
-
-    let lib_dir = match config_result {
-        Ok(output) if output.status.success() => String::from_utf8(output.stdout)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        _ if is_rustdoc => {
-            // For rustdoc builds, we can proceed without the library
-            eprintln!("Warning: tvm-ffi-config not available, skipping for documentation build");
-            return;
-        }
-        _ => {
-            panic!("Failed to run tvm-ffi-config. Make sure tvm-ffi is installed.");
-        }
+    // Source builds can name the exact native library directory. Installed
+    // consumers keep using `tvm-ffi-config` as before.
+    let lib_dir = match env::var("TVM_FFI_LIB_DIR") {
+        Ok(lib_dir) => lib_dir,
+        Err(_) => match Command::new("tvm-ffi-config").arg("--libdir").output() {
+            Ok(output) if output.status.success() => String::from_utf8(output.stdout)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            _ if is_rustdoc => {
+                // For rustdoc builds, we can proceed without the library
+                eprintln!(
+                    "Warning: tvm-ffi-config not available, skipping for documentation build"
+                );
+                return;
+            }
+            _ => {
+                panic!("Failed to run tvm-ffi-config. Make sure tvm-ffi is installed.");
+            }
+        },
     };
 
     if lib_dir.is_empty() {

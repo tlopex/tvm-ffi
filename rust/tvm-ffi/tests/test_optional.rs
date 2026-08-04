@@ -185,27 +185,35 @@ fn string_roundtrip_and_as_str() {
 }
 
 #[test]
-fn string_heap_clone_no_double_free() {
-    // long (heap) string exercises refcounted Clone/Drop through the wrapper.
+fn string_heap_clone_balances_reference_counts() {
     let long = String::from("a-very-long-heap-allocated-string-value");
-    let a = Optional::<String>::some(long);
+    let a = Optional::<String>::some(long.clone());
+    assert_eq!(AnyView::from(&long).debug_strong_count(), Some(2));
     let b = a.clone();
+    assert_eq!(AnyView::from(&long).debug_strong_count(), Some(3));
     assert_eq!(a.as_str(), Some("a-very-long-heap-allocated-string-value"));
     assert_eq!(b.as_str(), Some("a-very-long-heap-allocated-string-value"));
-    // both drop here: two dec_refs balancing the clone's inc_ref, no leak/UAF.
+    drop(b);
+    assert_eq!(AnyView::from(&long).debug_strong_count(), Some(2));
+    drop(a);
+    assert_eq!(AnyView::from(&long).debug_strong_count(), Some(1));
 }
 
 #[test]
 fn string_set_in_place() {
-    // Replace an engaged heap string: `set` must drop (dec_ref) the old heap
-    // string before storing the new one.
-    let mut o = Optional::<String>::some(String::from("first-long-heap-allocated-value"));
+    let first = String::from("first-long-heap-allocated-value");
+    let second = String::from("second-long-heap-allocated-value");
+    let mut o = Optional::<String>::some(first.clone());
+    assert_eq!(AnyView::from(&first).debug_strong_count(), Some(2));
     assert_eq!(o.as_str(), Some("first-long-heap-allocated-value"));
 
-    o.set(Some(String::from("second-long-heap-allocated-value")));
+    o.set(Some(second.clone()));
+    assert_eq!(AnyView::from(&first).debug_strong_count(), Some(1));
+    assert_eq!(AnyView::from(&second).debug_strong_count(), Some(2));
     assert_eq!(o.as_str(), Some("second-long-heap-allocated-value"));
 
     o.set(None);
+    assert_eq!(AnyView::from(&second).debug_strong_count(), Some(1));
     assert!(o.is_none());
     assert_eq!(o.as_str(), None);
 

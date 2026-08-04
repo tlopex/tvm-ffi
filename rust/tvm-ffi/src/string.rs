@@ -17,7 +17,7 @@
  * under the License.
  */
 use crate::derive::Object;
-use crate::object::{unsafe_, Object, ObjectArc, ObjectCoreWithExtraItems};
+use crate::object::{unsafe_, Object, ObjectArc, ObjectCoreWithExtraItems, RustAllocatableObject};
 use crate::type_traits::AnyCompatible;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
@@ -45,6 +45,10 @@ pub(crate) struct BytesObj {
     data: TVMFFIByteArray,
 }
 
+unsafe impl RustAllocatableObject for BytesObj {
+    unsafe fn drop_payload(_this: *mut Self) {}
+}
+
 impl Bytes {
     /// Create a new empty Bytes container
     pub fn new() -> Self {
@@ -66,13 +70,27 @@ impl Bytes {
     pub fn as_slice(&self) -> &[u8] {
         unsafe {
             if self.data.type_index == TypeIndex::kTVMFFISmallBytes as i32 {
-                std::slice::from_raw_parts(
-                    self.data.data_union.v_bytes.as_ptr(),
-                    self.data.small_str_len as usize,
-                )
+                let len = self.data.small_str_len as usize;
+                assert!(
+                    len <= self.data.data_union.v_bytes.len(),
+                    "small Bytes length exceeds inline storage"
+                );
+                std::slice::from_raw_parts(self.data.data_union.v_bytes.as_ptr(), len)
             } else {
+                assert!(
+                    !self.data.data_union.v_obj.is_null(),
+                    "large Bytes has null object"
+                );
                 let str_obj: &BytesObj = &*(self.data.data_union.v_obj as *const BytesObj);
-                std::slice::from_raw_parts(str_obj.data.data, str_obj.data.size)
+                if str_obj.data.size == 0 {
+                    &[]
+                } else {
+                    assert!(
+                        !str_obj.data.data.is_null(),
+                        "non-empty Bytes has null data"
+                    );
+                    std::slice::from_raw_parts(str_obj.data.data, str_obj.data.size)
+                }
             }
         }
     }
@@ -128,11 +146,12 @@ where
                 });
                 // reset the data ptr correctly after Arc is created
                 let obj = &mut *ObjectArc::as_raw_mut(&mut obj_arc);
-                obj.data.data = BytesObj::extra_items(obj).as_ptr();
-                let extra_items = BytesObj::extra_items_mut(obj);
-                extra_items[..value.len()].copy_from_slice(value);
-                // write the trailing \0 for ffi compatibility
-                extra_items[value.len()] = 0;
+                let extra_items = BytesObj::extra_items_uninit_mut(obj);
+                let data = extra_items.as_mut_ptr().cast::<u8>();
+                for (slot, byte) in extra_items.iter_mut().zip(value.iter().copied().chain([0])) {
+                    slot.write(byte);
+                }
+                obj.data.data = data;
                 Self {
                     data: TVMFFIAny {
                         type_index: TypeIndex::kTVMFFIBytes as i32,
@@ -239,6 +258,10 @@ pub(crate) struct StringObj {
     data: TVMFFIByteArray,
 }
 
+unsafe impl RustAllocatableObject for StringObj {
+    unsafe fn drop_payload(_this: *mut Self) {}
+}
+
 unsafe impl ObjectCoreWithExtraItems for StringObj {
     type ExtraItem = u8;
     #[inline]
@@ -270,20 +293,44 @@ impl String {
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             if self.data.type_index == TypeIndex::kTVMFFISmallStr as i32 {
-                std::slice::from_raw_parts(
-                    self.data.data_union.v_bytes.as_ptr(),
-                    self.data.small_str_len as usize,
-                )
+                let len = self.data.small_str_len as usize;
+                assert!(
+                    len <= self.data.data_union.v_bytes.len(),
+                    "small String length exceeds inline storage"
+                );
+                std::slice::from_raw_parts(self.data.data_union.v_bytes.as_ptr(), len)
             } else {
+                assert!(
+                    !self.data.data_union.v_obj.is_null(),
+                    "large String has null object"
+                );
                 let str_obj: &StringObj = &*(self.data.data_union.v_obj as *const StringObj);
-                std::slice::from_raw_parts(str_obj.data.data, str_obj.data.size)
+                if str_obj.data.size == 0 {
+                    &[]
+                } else {
+                    assert!(
+                        !str_obj.data.data.is_null(),
+                        "non-empty String has null data"
+                    );
+                    std::slice::from_raw_parts(str_obj.data.data, str_obj.data.size)
+                }
             }
         }
     }
 
-    /// Get the string as a str slice
+    /// Get the string as a `str` slice, if its FFI bytes are valid UTF-8.
+    pub fn try_as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(self.as_bytes())
+    }
+
+    /// Get the string as a `str` slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a native producer supplied bytes that are not valid UTF-8.
     pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+        self.try_as_str()
+            .expect("ffi.String contains invalid UTF-8")
     }
 }
 
@@ -317,11 +364,12 @@ where
                     },
                 });
                 let obj = &mut *ObjectArc::as_raw_mut(&mut obj_arc);
-                obj.data.data = StringObj::extra_items(obj).as_ptr();
-                let extra_items = StringObj::extra_items_mut(obj);
-                extra_items[..bytes.len()].copy_from_slice(bytes);
-                // write the trailing \0 for ffi compatibility
-                extra_items[bytes.len()] = 0;
+                let extra_items = StringObj::extra_items_uninit_mut(obj);
+                let data = extra_items.as_mut_ptr().cast::<u8>();
+                for (slot, byte) in extra_items.iter_mut().zip(bytes.iter().copied().chain([0])) {
+                    slot.write(byte);
+                }
+                obj.data.data = data;
                 Self {
                     data: TVMFFIAny {
                         type_index: TypeIndex::kTVMFFIStr as i32,

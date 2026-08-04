@@ -20,8 +20,8 @@
 use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeIndex, TVMFFITypeRegisterAttr};
 use tvm_ffi::{
     dispatch, structural_visit, structural_walk, Any, AnyView, Array, DefRegionKind, Error,
-    Function, Map, Object, Result, Shape, String as FfiString, StructuralVisitor, VisitInterrupt,
-    VisitValue, WalkOrder, WalkResult, RUNTIME_ERROR,
+    Function, Map, Object, ObjectRefCore, Result, Shape, String as FfiString, StructuralVisitor,
+    VisitInterrupt, VisitValue, WalkOrder, WalkResult, RUNTIME_ERROR,
 };
 
 fn runtime_error(message: &str) -> Error {
@@ -48,7 +48,7 @@ fn plain_walk_uses_native_sequence_fallback() {
 }
 
 #[test]
-fn plain_walk_uses_native_map_fallback() {
+fn plain_walk_visits_map_entries() {
     let root: Map<FfiString, i64> = [(FfiString::from("a"), 1i64), (FfiString::from("b"), 2i64)]
         .into_iter()
         .collect();
@@ -66,6 +66,74 @@ fn plain_walk_uses_native_map_fallback() {
     .unwrap()
     .is_none());
     assert_eq!(integers, 2);
+}
+
+#[test]
+fn malformed_reflection_metadata_is_rejected_before_field_access() {
+    // Force-load libtvm_ffi_testing so its static global registrations run in
+    // this otherwise core-only integration test binary.
+    assert_eq!(
+        unsafe { tvm_ffi::tvm_ffi_sys::TVMFFITestingDummyTarget() },
+        0
+    );
+    let make = Function::get_global("testing.make_malformed_reflection_object").unwrap();
+
+    // Each case mutates a dedicated native registry entry only in this test
+    // process. A successful walk would mean Rust reached the field getter with
+    // an invalid pointer/count instead of rejecting the metadata boundary.
+    for (case, description) in [
+        (1i64, "negative offset"),
+        (2, "field beyond total size"),
+        (3, "non-power-of-two alignment"),
+        (4, "negative field count"),
+        (5, "null ancestor table"),
+        (6, "missing object-size metadata"),
+    ] {
+        let root = make.call_packed(&[AnyView::from(&case)]).unwrap();
+        let error = match structural_walk(
+            &root,
+            |_value: &VisitValue| WalkResult::Advance,
+            WalkOrder::PreOrder,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed reflection case `{description}` unexpectedly walked"),
+        };
+        assert_eq!(error.kind(), RUNTIME_ERROR, "case `{description}`");
+
+        // The same validation backs generated field getters. The null-ancestor
+        // case is rejected during the ObjectRef subtype check itself; all field
+        // metadata cases reach and fail the shared checked-address path.
+        if case != 5 {
+            let object = tvm_ffi::object::ObjectRef::try_from(root).unwrap();
+            let owner_type_index = object.runtime_type_index().unwrap();
+            let error =
+                match tvm_ffi::object::get_object_field_any(&object, owner_type_index, "value") {
+                    Err(error) => error,
+                    Ok(_) => panic!("malformed reflection case `{description}` returned a field"),
+                };
+            assert_eq!(error.kind(), RUNTIME_ERROR, "case `{description}`");
+        } else {
+            assert!(tvm_ffi::object::ObjectRef::try_from(root).is_err());
+        }
+    }
+
+    // Restore the canonical entry and prove the same native object remains
+    // traversable when its metadata is valid.
+    let root = make.call_packed(&[AnyView::from(&0i64)]).unwrap();
+    let mut integers = Vec::new();
+    assert!(structural_walk(
+        &root,
+        |value: &VisitValue| {
+            if let Some(value) = value.cast::<i64>() {
+                integers.push(value);
+            }
+            WalkResult::Advance
+        },
+        WalkOrder::PreOrder,
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(integers, vec![7]);
 }
 
 #[derive(Default)]
@@ -229,8 +297,9 @@ fn mutable_dict_is_snapshotted_before_callbacks() {
 }
 
 #[test]
-fn dense_map_layout_is_traversed_completely() {
-    // More than 4 entries forces the dense (block + iteration list) layout.
+fn large_map_is_traversed_completely() {
+    // Exercise a map large enough for C++ to choose a non-trivial internal
+    // representation. Rust traversal must remain independent of that choice.
     let root: Map<FfiString, i64> = (0..9)
         .map(|i| (FfiString::from(format!("k{i}")), i as i64))
         .collect();

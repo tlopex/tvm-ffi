@@ -172,11 +172,15 @@ unsafe impl AnyCompatible for DLDataType {
     }
 }
 
-/// Trait to convert standard data types to DLDataType
+/// Trait to convert plain Rust data types to DLDataType.
 ///
-/// This trait provides a way to get the corresponding DLDataType for standard Rust types.
-/// It's implemented for common integer, unsigned integer, and floating-point types.
-pub trait AsDLDataType: Copy {
+/// # Safety
+///
+/// Every initialized bit pattern of `Self` must be valid, and
+/// `DL_DATA_TYPE` must describe exactly one `Self` in memory, including its
+/// byte size and alignment requirements. Tensor slice access relies on this
+/// contract when borrowing foreign DLPack storage.
+pub unsafe trait AsDLDataType: Copy {
     /// The corresponding DLDataType for this type
     const DL_DATA_TYPE: DLDataType;
 }
@@ -187,7 +191,7 @@ pub trait AsDLDataType: Copy {
 /// It takes the type, the DLPack data type code, and the number of bits.
 macro_rules! impl_as_dl_data_type {
     ($type: ty, $code: expr, $bits: expr) => {
-        impl AsDLDataType for $type {
+        unsafe impl AsDLDataType for $type {
             const DL_DATA_TYPE: DLDataType = DLDataType {
                 code: $code as u8,
                 bits: $bits as u8,

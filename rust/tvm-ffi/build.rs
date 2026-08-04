@@ -62,15 +62,17 @@ fn update_ld_library_path(lib_dir: &str) {
 }
 
 fn main() {
-    // Run `mylib-config --libdir` to get the library path
-    let config_output = Command::new("tvm-ffi-config")
-        .arg("--libdir")
-        .output()
-        .expect("Failed to run tvm-ffi-config");
-    let lib_dir = String::from_utf8(config_output.stdout)
-        .expect("Invalid UTF-8 output from tvm-ffi-config")
-        .trim()
-        .to_string();
+    println!("cargo:rerun-if-env-changed=TVM_FFI_LIB_DIR");
+    let lib_dir = env::var("TVM_FFI_LIB_DIR").unwrap_or_else(|_| {
+        let config_output = Command::new("tvm-ffi-config")
+            .arg("--libdir")
+            .output()
+            .expect("Failed to run tvm-ffi-config");
+        String::from_utf8(config_output.stdout)
+            .expect("Invalid UTF-8 output from tvm-ffi-config")
+            .trim()
+            .to_string()
+    });
     // update the LD_LIBRARY_PATH environment variable
     // note that we will also need to update ld_library_path for
     // the cases here besides the tvm-ffi-sys crate so cargo test works out of the box

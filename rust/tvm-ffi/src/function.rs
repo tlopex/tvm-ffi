@@ -20,12 +20,15 @@ use crate::any::{Any, AnyView};
 use crate::derive::{Object, ObjectRef};
 use crate::error::{Error, Result};
 use crate::function_internal::{AsPackedCallable, TupleAsPackedArgs};
-use crate::object::{Object, ObjectArc, ObjectCore, ObjectRef};
+use crate::object::{
+    checked_metadata_str, checked_object_cell, checked_type_attr, checked_type_info,
+    checked_type_methods, Object, ObjectArc, ObjectCore, ObjectRef,
+};
 use crate::type_traits::AnyCompatible;
 use tvm_ffi_sys::{
     TVMFFIAny, TVMFFIByteArray, TVMFFIFunctionCell, TVMFFIFunctionCreate, TVMFFIFunctionGetGlobal,
-    TVMFFIFunctionSetGlobal, TVMFFIGetTypeAttrColumn, TVMFFIGetTypeInfo, TVMFFIObjectHandle,
-    TVMFFISafeCallType, TVMFFITypeIndex,
+    TVMFFIFunctionSetGlobal, TVMFFIGetTypeAttrColumn, TVMFFIObjectHandle, TVMFFISafeCallType,
+    TVMFFITypeIndex,
 };
 
 /// function object
@@ -79,19 +82,15 @@ impl<F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static> CallbackFunctionO
         num_args: i32,
         result: *mut TVMFFIAny,
     ) -> i32 {
-        let this = &*(handle as *mut Self);
-        let packed_args = std::slice::from_raw_parts(args as *const AnyView, num_args as usize);
-        let ret_value = (this.callback)(packed_args);
-        match ret_value {
-            Ok(value) => {
-                *result = Any::into_raw_ffi_any(value);
-                0
-            }
-            Err(error) => {
-                Error::set_raised(&error);
-                -1
-            }
-        }
+        crate::function_internal::invoke_packed_c_abi(args, num_args, result, |packed_args| {
+            crate::ensure!(
+                !handle.is_null(),
+                crate::error::VALUE_ERROR,
+                "callback handle is null"
+            );
+            let this = &*handle.cast::<Self>();
+            (this.callback)(packed_args)
+        })
     }
 }
 
@@ -108,16 +107,121 @@ unsafe impl<F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static> ObjectCore
     }
 }
 
+unsafe impl<F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static>
+    crate::object::RustAllocatableObject for CallbackFunctionObjImpl<F>
+{
+    unsafe fn drop_payload(this: *mut Self) {
+        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*this).callback));
+    }
+}
+
+type ScopedPackedCall = unsafe fn(*mut std::ffi::c_void, &[AnyView<'_>]) -> Result<Any>;
+
+struct ScopedPackedEntry {
+    handle: *mut std::ffi::c_void,
+    callback: *mut std::ffi::c_void,
+    call: ScopedPackedCall,
+    active: std::cell::Cell<bool>,
+    previous: *const ScopedPackedEntry,
+}
+
+thread_local! {
+    static SCOPED_PACKED_HEAD: std::cell::Cell<*const ScopedPackedEntry> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+struct ScopedPackedRegistration<'a> {
+    entry: &'a ScopedPackedEntry,
+}
+
+impl Drop for ScopedPackedRegistration<'_> {
+    fn drop(&mut self) {
+        SCOPED_PACKED_HEAD.with(|head| {
+            debug_assert_eq!(head.get(), self.entry as *const ScopedPackedEntry);
+            head.set(self.entry.previous);
+        });
+    }
+}
+
+struct ScopedCallReset<'a>(&'a std::cell::Cell<bool>);
+
+impl Drop for ScopedCallReset<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+unsafe fn invoke_scoped_callback<F>(
+    callback: *mut std::ffi::c_void,
+    args: &[AnyView<'_>],
+) -> Result<Any>
+where
+    F: FnMut(&[AnyView<'_>]) -> Result<Any>,
+{
+    unsafe { (&mut *callback.cast::<F>())(args) }
+}
+
+unsafe extern "C" fn call_scoped_packed(
+    handle: *mut std::ffi::c_void,
+    args: *const TVMFFIAny,
+    num_args: i32,
+    result: *mut TVMFFIAny,
+) -> i32 {
+    unsafe {
+        crate::function_internal::invoke_packed_c_abi(args, num_args, result, |args| {
+            let entry = SCOPED_PACKED_HEAD.with(|head| {
+                let mut entry = head.get();
+                while !entry.is_null() {
+                    if (*entry).handle == handle {
+                        return entry;
+                    }
+                    entry = (*entry).previous;
+                }
+                std::ptr::null()
+            });
+            if entry.is_null() {
+                return Err(Error::new(
+                    crate::error::RUNTIME_ERROR,
+                    "scoped callback is inactive or was invoked from another thread",
+                    "",
+                ));
+            }
+
+            let entry = &*entry;
+            if entry.active.replace(true) {
+                return Err(Error::new(
+                    crate::error::RUNTIME_ERROR,
+                    "scoped callback cannot be invoked recursively",
+                    "",
+                ));
+            }
+            let _reset = ScopedCallReset(&entry.active);
+            (entry.call)(entry.callback, args)
+        })
+    }
+}
+
+unsafe extern "C" fn drop_scoped_handle(handle: *mut std::ffi::c_void) {
+    unsafe { drop(Box::from_raw(handle.cast::<u8>())) }
+}
+
 impl Function {
     /// Call the function in packed format.
     pub fn call_packed(&self, packed_args: &[AnyView]) -> Result<Any> {
+        let num_args = i32::try_from(packed_args.len()).map_err(|_| {
+            Error::new(
+                crate::error::VALUE_ERROR,
+                "packed argument count exceeds i32::MAX",
+                "",
+            )
+        })?;
         unsafe {
             let packed_args_ptr = packed_args.as_ptr() as *const TVMFFIAny;
             let mut result = Any::new();
             let ret_code = (self.data.cell.safe_call)(
                 ObjectArc::as_raw(&self.data) as *mut FunctionObj as *mut std::ffi::c_void,
                 packed_args_ptr,
-                packed_args.len() as i32,
+                num_args,
                 Any::as_data_ptr(&mut result),
             );
             if ret_code == 0 {
@@ -126,6 +230,93 @@ impl Function {
                 Err(Error::from_raised())
             }
         }
+    }
+
+    /// Use a packed callback that may borrow local, thread-bound state.
+    ///
+    /// The callback is active only while `body` runs and only on the current
+    /// thread. A cloned function invoked later, recursively, or from another
+    /// thread returns a normal TVM error without touching the borrowed state.
+    /// This makes the helper suitable for native APIs whose documented
+    /// contract invokes a callback synchronously without retaining it.
+    #[doc(hidden)]
+    pub fn with_scoped_packed<F, T>(
+        callback: &mut F,
+        body: impl FnOnce(Function) -> Result<T>,
+    ) -> Result<T>
+    where
+        F: FnMut(&[AnyView<'_>]) -> Result<Any>,
+    {
+        // A non-zero-sized token remains owned by the native Function object,
+        // including any clones retained beyond this lexical scope.
+        let mut token = Box::new(0_u8);
+        let handle = (&mut *token as *mut u8).cast::<std::ffi::c_void>();
+        // SAFETY: `handle` is valid until `drop_scoped_handle`; the C callback
+        // treats it only as an identity key. Borrowed state lives separately in
+        // the thread-local entry below and is never dereferenced when inactive.
+        let function = unsafe {
+            Function::try_from_extern_c(handle, call_scoped_packed, Some(drop_scoped_handle))?
+        };
+        std::mem::forget(token);
+        let previous = SCOPED_PACKED_HEAD.with(|head| head.get());
+        let entry = ScopedPackedEntry {
+            handle,
+            callback: (callback as *mut F).cast(),
+            call: invoke_scoped_callback::<F>,
+            active: std::cell::Cell::new(false),
+            previous,
+        };
+        SCOPED_PACKED_HEAD.with(|head| head.set(&entry));
+        let _registration = ScopedPackedRegistration { entry: &entry };
+        // Keep the original Function (and therefore its token) alive until the
+        // registration is removed. `body` may drop or retain this clone.
+        body(function.clone())
+    }
+
+    /// Call this function using the packed KWARGS protocol.
+    ///
+    /// `positional` is emitted before the process-wide KWARGS sentinel.  Each
+    /// named entry is then emitted as a string key followed by its value.  All
+    /// temporary strings and the sentinel remain alive for the synchronous
+    /// native call.
+    pub fn call_packed_with_kwargs(
+        &self,
+        positional: &[AnyView<'_>],
+        named: &[(&str, AnyView<'_>)],
+    ) -> Result<Any> {
+        let total_args = named
+            .len()
+            .checked_mul(2)
+            .and_then(|slots| positional.len().checked_add(slots))
+            .and_then(|slots| slots.checked_add(1))
+            .ok_or_else(|| {
+                Error::new(
+                    crate::error::VALUE_ERROR,
+                    "packed argument count overflow",
+                    "",
+                )
+            })?;
+        i32::try_from(total_args).map_err(|_| {
+            Error::new(
+                crate::error::VALUE_ERROR,
+                "packed argument count exceeds i32::MAX",
+                "",
+            )
+        })?;
+
+        let kwargs = get_kwargs_object()?;
+        let keys = named
+            .iter()
+            .map(|(key, _)| crate::String::from(*key))
+            .collect::<Vec<_>>();
+        let mut packed_args = Vec::with_capacity(total_args);
+        packed_args.extend_from_slice(positional);
+        packed_args.push(AnyView::from(&kwargs));
+        for ((_, value), key) in named.iter().zip(&keys) {
+            packed_args.push(AnyView::from(key));
+            packed_args.push(*value);
+        }
+        self.call_packed(&packed_args)
     }
 
     pub fn call_tuple<TupleType>(&self, tuple_args: TupleType) -> Result<Any>
@@ -222,18 +413,11 @@ impl Function {
     /// required fallback. This matches the Python binding's lookup order.
     pub fn from_type_method(type_index: i32, method_name: &str) -> Result<Function> {
         unsafe {
-            let info = TVMFFIGetTypeInfo(type_index);
-            if info.is_null() {
-                crate::bail!(
-                    crate::error::TYPE_ERROR,
-                    "no type info for type_index `{}`",
-                    type_index
-                );
-            }
-            let info = &*info;
-            for index in 0..info.num_methods {
-                let method = &*info.methods.add(index as usize);
-                if method.name.as_str() == method_name {
+            let info = checked_type_info(type_index)?;
+            for method in checked_type_methods(info)? {
+                let registered_name =
+                    checked_metadata_str(type_index, "method name", &method.name)?;
+                if registered_name == method_name {
                     if !<Function as AnyCompatible>::check_any_strict(&method.method) {
                         crate::bail!(
                             crate::error::TYPE_ERROR,
@@ -242,6 +426,7 @@ impl Function {
                             type_index
                         );
                     }
+                    checked_object_cell(&method.method, "reflected method Function cell")?;
                     return Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
                         &method.method,
                     ));
@@ -250,24 +435,20 @@ impl Function {
 
             let attr_name = TVMFFIByteArray::from_str(method_name);
             let column = TVMFFIGetTypeAttrColumn(&attr_name);
-            if !column.is_null() {
-                let column = &*column;
-                let offset = type_index - column.begin_index;
-                if offset >= 0 && offset < column.size && !column.data.is_null() {
-                    let attr = &*column.data.add(offset as usize);
-                    if attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32 {
-                        if !<Function as AnyCompatible>::check_any_strict(attr) {
-                            crate::bail!(
-                                crate::error::TYPE_ERROR,
-                                "type attribute `{}` on type_index `{}` is not a Function",
-                                method_name,
-                                type_index
-                            );
-                        }
-                        return Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
-                            attr,
-                        ));
+            if let Some(attr) = checked_type_attr(column, type_index, method_name)? {
+                if attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32 {
+                    if !<Function as AnyCompatible>::check_any_strict(&attr) {
+                        crate::bail!(
+                            crate::error::TYPE_ERROR,
+                            "type attribute `{}` on type_index `{}` is not a Function",
+                            method_name,
+                            type_index
+                        );
                     }
+                    checked_object_cell(&attr, "reflected type-attribute Function cell")?;
+                    return Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
+                        &attr,
+                    ));
                 }
             }
         }
@@ -381,6 +562,14 @@ impl Function {
         safe_call: TVMFFISafeCallType,
         deleter: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
     ) -> Self {
+        unsafe { Self::try_from_extern_c(handle, safe_call, deleter) }.unwrap()
+    }
+
+    unsafe fn try_from_extern_c(
+        handle: *mut std::ffi::c_void,
+        safe_call: TVMFFISafeCallType,
+        deleter: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    ) -> Result<Self> {
         unsafe {
             let mut out_handle: TVMFFIObjectHandle = std::ptr::null_mut();
             crate::check_safe_call!(TVMFFIFunctionCreate(
@@ -388,11 +577,10 @@ impl Function {
                 safe_call,
                 deleter,
                 &mut out_handle
-            ))
-            .unwrap();
-            Self {
+            ))?;
+            Ok(Self {
                 data: ObjectArc::<FunctionObj>::from_raw(out_handle as *mut FunctionObj),
-            }
+            })
         }
     }
 }
@@ -410,7 +598,7 @@ pub fn get_kwargs_object() -> Result<ObjectRef> {
         }
         let value: ObjectRef = Function::get_global("ffi.GetKwargsObject")?
             .call_packed(&[])?
-            .try_into()?;
+            .try_into_strict()?;
         let _ = cell.set(value.clone());
         Ok(value)
     })

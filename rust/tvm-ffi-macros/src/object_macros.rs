@@ -18,14 +18,39 @@
  */
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::DeriveInput;
+use syn::{DeriveInput, Meta, NestedMeta};
 
 use crate::utils::*;
+
+fn require_repr_c(derive_input: &DeriveInput, derive_name: &str) -> Result<(), syn::Error> {
+    let has_repr_c = derive_input.attrs.iter().any(|attr| {
+        if !attr.path.is_ident("repr") {
+            return false;
+        }
+        match attr.parse_meta() {
+            Ok(Meta::List(repr)) => repr.nested.iter().any(
+                |item| matches!(item, NestedMeta::Meta(Meta::Path(path)) if path.is_ident("C")),
+            ),
+            _ => false,
+        }
+    });
+    if has_repr_c {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            &derive_input.ident,
+            format!("#[derive({derive_name})] requires #[repr(C)]"),
+        ))
+    }
+}
 
 /// Derive Object trait for a struct to generate boilerplate code
 pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
     let tvm_ffi_crate = get_tvm_ffi_crate();
     let derive_input = syn::parse_macro_input!(input as DeriveInput);
+    if let Err(err) = require_repr_c(&derive_input, "Object") {
+        return err.into_compile_error().into();
+    }
     let struct_name = derive_input.ident.clone();
 
     let type_key = get_attr(&derive_input, "type_key")
@@ -44,6 +69,8 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
             let type_index_expr =
                 type_index.expect("Expect #[type_index(TypeIndex::<my_type_index>)] attribute");
             quote! {
+                const TYPE_INDEX_STATIC: bool = true;
+
                 #[inline]
                 fn type_index() -> i32 {
                     #type_index_expr as i32
@@ -54,21 +81,30 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
             quote! {
                 #[inline]
                 fn type_index() -> i32 {
-                    static TYPE_INDEX: std::sync::LazyLock<i32> = std::sync::LazyLock::new(||
-                        unsafe {
-                            let type_key_arg =
-                                 #tvm_ffi_crate::tvm_ffi_sys::TVMFFIByteArray::from_str(#type_key);
-                            let mut tindex = 0;
-                            let ret =  #tvm_ffi_crate::tvm_ffi_sys::TVMFFITypeKeyToIndex(
-                                &type_key_arg, &mut tindex
-                            );
-                            if ret != 0 {
-                                panic!("Failed to get type index for type key: {}", #type_key);
-                            }
-                            tindex
+                    #struct_name::try_type_index().unwrap_or_else(|error|
+                        panic!("Failed to get type index for type key {}: {}", #type_key, error)
+                    )
+                }
+
+                #[inline]
+                fn try_type_index() -> #tvm_ffi_crate::error::Result<i32> {
+                    static TYPE_INDEX: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+                    if let Some(type_index) = TYPE_INDEX.get() {
+                        return Ok(*type_index);
+                    }
+                    unsafe {
+                        let type_key_arg =
+                            #tvm_ffi_crate::tvm_ffi_sys::TVMFFIByteArray::from_str(#type_key);
+                        let mut type_index = 0;
+                        let status = #tvm_ffi_crate::tvm_ffi_sys::TVMFFITypeKeyToIndex(
+                            &type_key_arg, &mut type_index
+                        );
+                        if status == 0 {
+                            Ok(*TYPE_INDEX.get_or_init(|| type_index))
+                        } else {
+                            Err(#tvm_ffi_crate::error::Error::from_raised())
                         }
-                    );
-                    *TYPE_INDEX
+                    }
                 }
             }
         }
@@ -76,16 +112,16 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
     // search for field name base and derive the base type
     // we expect base always to be the first field
     let final_parent_check = match &derive_input.data {
-        syn::Data::Struct(s) => s.fields.iter().next().and_then(|f| {
+        syn::Data::Struct(s) => s.fields.iter().next().map(|f| {
             let base_ty = f.ty.clone();
-            Some(quote! {
+            quote! {
                 const _: () = {
                     ::core::assert!(
                         !<#base_ty as #tvm_ffi_crate::object::ObjectCore>::TYPE_FINAL,
                         "an object type cannot derive from a final parent"
                     );
                 };
-            })
+            }
         }),
         _ => panic!("First field must be `<base_name>: <ObjectCoreType>`"),
     };
@@ -176,6 +212,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                 type ContainerType =
                     <#struct_name as #tvm_ffi_crate::object::ObjectRefCore>::ContainerType;
                 <ContainerType as #tvm_ffi_crate::object::ObjectCore>::TYPE_FINAL
+                    && <ContainerType as #tvm_ffi_crate::object::ObjectCore>::TYPE_INDEX_STATIC
             };
 
             #[inline]

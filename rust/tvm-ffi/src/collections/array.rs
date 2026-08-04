@@ -23,7 +23,10 @@ use std::ops::Deref;
 use crate::any::TryFromTemp;
 use crate::derive::Object;
 use crate::object::{Object, ObjectArc};
-use crate::{Any, AnyCompatible, AnyView, ObjectCoreWithExtraItems, ObjectRefCore};
+use crate::{
+    Any, AnyCompatible, AnyView, ObjectCore, ObjectCoreWithExtraItems, ObjectRefCore,
+    RustAllocatableObject,
+};
 use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi_sys::{TVMFFIAny, TVMFFIObject};
 
@@ -44,7 +47,69 @@ pub struct ArrayObj {
 unsafe impl ObjectCoreWithExtraItems for ArrayObj {
     type ExtraItem = TVMFFIAny;
     fn extra_items_count(this: &Self) -> usize {
-        this.size as usize
+        // Capacity fixes the allocation layout; size is only the initialized
+        // prefix and may change through C++ copy-on-write mutation.
+        usize::try_from(this.capacity).expect("Array capacity must be non-negative")
+    }
+}
+
+// `ArrayObj` is a public ABI mirror, so safe Rust code can construct arbitrary
+// field values. Keep resource-owning Drop and Rust allocation eligibility on a
+// private complete layout whose invariants are established by `Array::new`.
+#[repr(C)]
+struct RustArrayObj {
+    array: ArrayObj,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<RustArrayObj>() == core::mem::size_of::<ArrayObj>());
+    assert!(core::mem::align_of::<RustArrayObj>() == core::mem::align_of::<ArrayObj>());
+};
+
+unsafe impl ObjectCore for RustArrayObj {
+    const TYPE_KEY: &'static str = <ArrayObj as ObjectCore>::TYPE_KEY;
+    const TYPE_DEPTH: i32 = <ArrayObj as ObjectCore>::TYPE_DEPTH;
+    const TYPE_FINAL: bool = <ArrayObj as ObjectCore>::TYPE_FINAL;
+
+    fn type_index() -> i32 {
+        ArrayObj::type_index()
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        unsafe { ArrayObj::object_header_mut(&mut this.array) }
+    }
+}
+
+// SAFETY: RustArrayObj is a complete repr(C) allocation layout, not a foreign
+// prefix mirror. Its `drop_payload` implementation owns the initialized prefix.
+unsafe impl RustAllocatableObject for RustArrayObj {
+    unsafe fn drop_payload(this: *mut Self) {
+        let array = std::ptr::addr_of_mut!((*this).array);
+        let size = std::ptr::addr_of_mut!((*array).size);
+        let data = std::ptr::read(std::ptr::addr_of!((*array).data)).cast::<TVMFFIAny>();
+
+        // TVMFFIAny is the raw ABI representation of an owning Any and does
+        // not implement Drop itself. Reconstitute each initialized element so
+        // its object reference, if any, is released exactly once.
+        while std::ptr::read(size) > 0 {
+            let next = std::ptr::read(size) - 1;
+            std::ptr::write(size, next);
+            let raw = std::ptr::read(data.add(next as usize));
+            drop(Any::from_raw_ffi_any(raw));
+        }
+
+        let data_deleter = std::ptr::replace(std::ptr::addr_of_mut!((*array).data_deleter), None);
+        if let Some(data_deleter) = data_deleter {
+            data_deleter(data.cast());
+        }
+    }
+}
+
+unsafe impl ObjectCoreWithExtraItems for RustArrayObj {
+    type ExtraItem = TVMFFIAny;
+
+    fn extra_items_count(this: &Self) -> usize {
+        ArrayObj::extra_items_count(&this.array)
     }
 }
 
@@ -98,30 +163,46 @@ impl<T: AnyCompatible + Clone> Array<T> {
     /// Internal helper to allocate an ArrayObj with specific headroom.
     fn new_with_capacity(items: Vec<T>, capacity: usize) -> Self {
         let size = items.len();
+        assert!(
+            capacity >= size,
+            "Array capacity cannot be smaller than its size"
+        );
+        let capacity = i64::try_from(capacity).expect("Array capacity exceeds i64::MAX");
 
-        // Allocate with capacity
-        let arc = ObjectArc::<ArrayObj>::new_with_extra_items(ArrayObj {
-            object: Object::new(),
-            data: core::ptr::null_mut(),
-            size: size as i64,
-            capacity: capacity as i64,
-            data_deleter: None,
+        // Keep size at zero until each slot has been initialized. If converting
+        // an item panics, RustArrayObj::drop only visits the completed prefix.
+        let arc = ObjectArc::<RustArrayObj>::new_with_extra_items(RustArrayObj {
+            array: ArrayObj {
+                object: Object::new(),
+                data: core::ptr::null_mut(),
+                size: 0,
+                capacity,
+                data_deleter: None,
+            },
         });
 
         unsafe {
-            let raw_ptr = ObjectArc::as_raw(&arc) as *mut ArrayObj;
-            let container = &mut *raw_ptr;
+            let raw_ptr = ObjectArc::as_raw(&arc) as *mut RustArrayObj;
+            let allocation = &mut *raw_ptr;
 
-            let base_ptr = ArrayObj::extra_items_mut(container).as_ptr() as *mut TVMFFIAny;
-            container.data = base_ptr as *mut _;
+            let base_ptr = RustArrayObj::extra_items_uninit_mut(allocation)
+                .as_mut_ptr()
+                .cast::<TVMFFIAny>();
+            allocation.array.data = base_ptr as *mut _;
 
             for (i, item) in items.into_iter().enumerate() {
                 let any: Any = Any::from(item);
                 let raw = Any::into_raw_ffi_any(any);
                 core::ptr::write(base_ptr.add(i), raw);
+                allocation.array.size += 1;
             }
+
+            // RustArrayObj is layout-identical to its public ArrayObj prefix.
+            // Preserve the private concrete deleter stored in the object header
+            // while exposing the standard ABI container type to Array<T>.
+            let raw_ptr = ObjectArc::into_raw(arc).cast::<ArrayObj>();
+            Self::from_data(ObjectArc::from_raw(raw_ptr))
         }
-        Self::from_data(arc)
     }
 
     pub fn len(&self) -> usize {

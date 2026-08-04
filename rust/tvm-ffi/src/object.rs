@@ -17,17 +17,21 @@
  * under the License.
  */
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
-use crate::any::{Any, TryFromTemp};
+use crate::any::Any;
 use crate::derive::ObjectRef;
 use crate::error::Result;
 use crate::type_traits::AnyCompatible;
 pub use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 /// Object related ABI handling
-use tvm_ffi_sys::{TVMFFIAny, TVMFFIGetTypeInfo, TVMFFIObject, COMBINED_REF_COUNT_BOTH_ONE};
+use tvm_ffi_sys::{
+    TVMFFIAny, TVMFFIByteArray, TVMFFIFieldInfo, TVMFFIGetTypeInfo, TVMFFIMethodInfo, TVMFFIObject,
+    TVMFFITypeAttrColumn, TVMFFITypeInfo, TVMFFITypeMetadata, COMBINED_REF_COUNT_BOTH_ONE,
+};
 
 /// Object type is by default the TVMFFIObject
 #[repr(C)]
@@ -53,6 +57,11 @@ pub struct Object {
 /// fn require_send<T: Send>() {}
 /// require_send::<tvm_ffi::ObjectArc<tvm_ffi::Object>>();
 /// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<tvm_ffi::ObjectArc<tvm_ffi::Object>>();
+/// ```
 #[repr(C)]
 pub struct ObjectArc<T: ObjectCore> {
     // C++ ObjectRef uses a nullable pointer slot.  Top-level handles returned
@@ -63,9 +72,6 @@ pub struct ObjectArc<T: ObjectCore> {
     ptr: *mut T,
     _phantom: std::marker::PhantomData<T>,
 }
-
-unsafe impl<T: Send + Sync + ObjectCore> Send for ObjectArc<T> {}
-unsafe impl<T: Send + Sync + ObjectCore> Sync for ObjectArc<T> {}
 
 /// Traits that can be used to check if a type is an object
 ///
@@ -85,8 +91,20 @@ pub unsafe trait ObjectCore: Sized + 'static {
     /// A final type has no separately registered object-system subtype.
     #[doc(hidden)]
     const TYPE_FINAL: bool = false;
+    /// Whether `type_index()` is a process-lifetime constant that needs no
+    /// dynamic registry lookup.
+    #[doc(hidden)]
+    const TYPE_INDEX_STATIC: bool = false;
     // return the type index of the object
     fn type_index() -> i32;
+    /// Fallible type-index lookup for dynamically registered object types.
+    ///
+    /// Static builtins use this default. Derive-generated dynamic types
+    /// override it so a missing registry entry is a normal mismatch rather
+    /// than a poisoned lazy-initializer panic.
+    fn try_type_index() -> Result<i32> {
+        Ok(Self::type_index())
+    }
     /// Return the object header
     /// This function is implemented as a static function so
     ///
@@ -99,9 +117,77 @@ pub unsafe trait ObjectCore: Sized + 'static {
     unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject;
 }
 
+/// Marker for a complete object layout that Rust may allocate and destroy.
+///
+/// [`ObjectCore`] alone only describes the object header and runtime type. It
+/// is intentionally sufficient for a Rust view over an object allocated by
+/// C++, including a partial layout mirror. Such a view must not be passed to
+/// [`ObjectArc::new`].
+///
+/// # Safety
+///
+/// `Self` must be a complete `#[repr(C)]` Rust layout whose object header is at
+/// offset zero. [`drop_payload`](RustAllocatableObject::drop_payload) must end
+/// the lifetime of every resource-owning field after that header without
+/// reading, writing, or ending the header itself. The header remains live while
+/// concurrent C++ weak references inspect its atomic counts and until the last
+/// weak reference releases the allocation.
+///
+/// Once an object is exposed to C++, its final strong reference may be released
+/// on any thread. Every payload resource and its `drop_payload` implementation
+/// must therefore permit destruction on an arbitrary thread, even though the
+/// Rust handle itself is deliberately not `Send`.
+///
+/// After `drop_payload` returns, it must be valid to deallocate the storage
+/// without running `Self`'s ordinary destructor. Implementations therefore
+/// manually drop each payload field that needs it; they must never call
+/// `drop_in_place` on the complete `Self`.
+/// This marker intentionally has no safe derive: matching the complete native
+/// layout and its invariants requires an explicit `unsafe impl` audit.
+///
+/// Deriving [`ObjectCore`] without opting into this marker leaves a foreign
+/// layout non-allocatable:
+///
+/// ```compile_fail
+/// #[repr(C)]
+/// #[derive(tvm_ffi::derive::Object)]
+/// #[type_key = "example.ForeignMirror"]
+/// struct ForeignMirror {
+///     base: tvm_ffi::Object,
+/// }
+///
+/// let value = ForeignMirror { base: tvm_ffi::Object::new() };
+/// let _ = tvm_ffi::ObjectArc::new(value);
+/// ```
+///
+/// Object layouts must use the C ABI:
+///
+/// ```compile_fail
+/// #[derive(tvm_ffi::derive::Object)]
+/// #[type_key = "example.MissingReprC"]
+/// struct MissingReprC {
+///     base: tvm_ffi::Object,
+/// }
+/// ```
+pub unsafe trait RustAllocatableObject: ObjectCore {
+    /// Destroy all Rust-owned payload while leaving `TVMFFIObject` untouched.
+    unsafe fn drop_payload(this: *mut Self);
+}
+
 /// Traits for objects with extra items that follows the object
 ///
 /// This extra trait can be helpful to implement array types and string types
+///
+/// # Safety
+///
+/// Every instance must be followed immediately by storage for at least
+/// `extra_items_count` properly aligned `ExtraItem` slots, and callers must
+/// initialize a slot before reading it. The count describes allocated slots,
+/// not necessarily the number currently initialized, and must never exceed the
+/// count used when the Rust allocation was created. If initialized extra items
+/// own resources but are stored in a raw ABI representation without [`Drop`],
+/// the containing object's destructor must release exactly the initialized
+/// items.
 pub unsafe trait ObjectCoreWithExtraItems: ObjectCore {
     /// type of extra items storage that follows the object
     type ExtraItem;
@@ -120,6 +206,19 @@ pub unsafe trait ObjectCoreWithExtraItems: ObjectCore {
         let extra_items_ptr = (this as *mut Self as *mut u8).add(std::mem::size_of::<Self>());
         std::slice::from_raw_parts_mut(
             extra_items_ptr as *mut Self::ExtraItem,
+            Self::extra_items_count(this),
+        )
+    }
+
+    /// Return the extra storage without claiming that its elements are initialized.
+    ///
+    /// Constructors must use this view until every returned slot has been
+    /// initialized. Creating `&mut [ExtraItem]` over freshly allocated bytes is
+    /// undefined behavior for types whose bit patterns are not all valid.
+    unsafe fn extra_items_uninit_mut(this: &mut Self) -> &mut [MaybeUninit<Self::ExtraItem>] {
+        let extra_items_ptr = (this as *mut Self as *mut u8).add(std::mem::size_of::<Self>());
+        std::slice::from_raw_parts_mut(
+            extra_items_ptr as *mut MaybeUninit<Self::ExtraItem>,
             Self::extra_items_count(this),
         )
     }
@@ -168,6 +267,19 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
         ObjectArc::is_null(Self::data(self))
     }
 
+    /// Return the object's dynamic runtime type index, or `None` for a null handle.
+    #[inline]
+    fn runtime_type_index(&self) -> Option<i32> {
+        let object = unsafe { ObjectArc::as_raw(Self::data(self)) };
+        if object.is_null() {
+            None
+        } else {
+            // ObjectRefCore requires every non-null allocation to begin with a
+            // valid TVMFFIObject header. The dynamic index lives in that prefix.
+            Some(unsafe { (*(object.cast::<TVMFFIObject>())).type_index })
+        }
+    }
+
     /// Return whether two object references point to the same C++ object.
     ///
     /// This is C++ `ObjectRef::same_as`. Defining it on the core trait keeps
@@ -193,8 +305,8 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
 #[doc(hidden)]
 #[inline(always)]
 pub fn is_instance_of<Target: ObjectCore>(object_type_index: i32) -> bool {
-    let target_type_index = Target::type_index();
-    is_instance_of_index(object_type_index, target_type_index)
+    Target::try_type_index()
+        .is_ok_and(|target_type_index| is_instance_of_index(object_type_index, target_type_index))
 }
 
 /// Runtime-index form of [`is_instance_of`].
@@ -212,19 +324,387 @@ pub fn is_instance_of_index(object_type_index: i32, target_type_index: i32) -> b
     if object_type_index < target_type_index {
         return false;
     }
-    unsafe {
-        let object_info = TVMFFIGetTypeInfo(object_type_index);
-        let target_info = TVMFFIGetTypeInfo(target_type_index);
-        if object_info.is_null() || target_info.is_null() {
+    let (object_info, target_info) = unsafe {
+        let Ok(object_info) = checked_type_info(object_type_index) else {
             return false;
-        }
-        let target_depth = (*target_info).type_depth;
-        if (*object_info).type_depth <= target_depth {
+        };
+        let Ok(target_info) = checked_type_info(target_type_index) else {
             return false;
-        }
-        let ancestor = *(*object_info).type_acenstors.add(target_depth as usize);
-        !ancestor.is_null() && (*ancestor).type_index == target_type_index
+        };
+        (object_info, target_info)
+    };
+    if object_info.type_depth <= target_info.type_depth {
+        return false;
     }
+    let Ok(ancestor) =
+        (unsafe { checked_type_ancestor(object_info, target_info.type_depth as usize) })
+    else {
+        return false;
+    };
+    ancestor.type_index == target_type_index
+}
+
+fn invalid_reflection_metadata(type_index: i32, detail: &str) -> crate::error::Error {
+    crate::error::Error::new(
+        crate::error::RUNTIME_ERROR,
+        &format!("invalid reflection metadata for type_index `{type_index}`: {detail}"),
+        "",
+    )
+}
+
+/// Whether the ABI permits a registry entry at this index. This catches the
+/// fixed gaps before calling `TVMFFIGetTypeInfo`, whose native contract aborts
+/// the process when its precondition (a registered index) is violated.
+fn can_have_registered_type_info(type_index: i32) -> bool {
+    (TypeIndex::kTVMFFINone as i32..=TypeIndex::kTVMFFISmallBytes as i32).contains(&type_index)
+        || (TypeIndex::kTVMFFIStaticObjectBegin as i32..TypeIndex::kTVMFFIStaticObjectEnd as i32)
+            .contains(&type_index)
+        || type_index >= TypeIndex::kTVMFFIDynObjectBegin as i32
+}
+
+/// Validate the observable shape of one process-lifetime native metadata
+/// table before creating a Rust slice for it.
+///
+/// This rejects malformed counts, null or misaligned non-empty tables, and
+/// extents that exceed Rust's maximum slice size. As with every C ABI, Rust
+/// cannot prove that an otherwise plausible foreign pointer still designates
+/// an allocation of the advertised extent; that remains a native registry
+/// invariant.
+unsafe fn checked_metadata_slice<T>(
+    type_index: i32,
+    label: &str,
+    data: *const T,
+    count: i32,
+) -> Result<&'static [T]> {
+    if count < 0 {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("{label} count is negative"),
+        ));
+    }
+    let count = count as usize;
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if data.is_null() {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("{label} table is null"),
+        ));
+    }
+    if data as usize % std::mem::align_of::<T>() != 0 {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("{label} table is misaligned"),
+        ));
+    }
+    let table_bytes = count.checked_mul(std::mem::size_of::<T>());
+    if !matches!(table_bytes, Some(bytes) if bytes <= isize::MAX as usize) {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("{label} table is too large"),
+        ));
+    }
+    Ok(std::slice::from_raw_parts(data, count))
+}
+
+/// Validate and decode a UTF-8 string embedded in reflection metadata.
+pub(crate) unsafe fn checked_metadata_str<'a>(
+    type_index: i32,
+    label: &str,
+    value: &'a TVMFFIByteArray,
+) -> Result<&'a str> {
+    if value.size == 0 {
+        return Ok("");
+    }
+    if value.data.is_null() {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("{label} has a null data pointer"),
+        ));
+    }
+    if value.size > isize::MAX as usize {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("{label} is too large"),
+        ));
+    }
+    let bytes = std::slice::from_raw_parts(value.data, value.size);
+    std::str::from_utf8(bytes).map_err(|_| {
+        invalid_reflection_metadata(type_index, &format!("{label} is not valid UTF-8"))
+    })
+}
+
+/// Fetch a registry entry and validate its identity and hierarchy table shape.
+///
+/// The type table owns its entries for the process lifetime. This validation is
+/// deliberately shared by generated field access and structural traversal so
+/// neither path turns malformed native metadata into a Rust reference.
+pub(crate) unsafe fn checked_type_info(type_index: i32) -> Result<&'static TVMFFITypeInfo> {
+    if !can_have_registered_type_info(type_index) {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            "type index lies in an unregistered ABI range",
+        ));
+    }
+    let info = TVMFFIGetTypeInfo(type_index);
+    if info.is_null() {
+        return Err(invalid_reflection_metadata(type_index, "type info is null"));
+    }
+    if info as usize % std::mem::align_of::<TVMFFITypeInfo>() != 0 {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            "type info is misaligned",
+        ));
+    }
+    let info = &*info;
+    if info.type_index != type_index {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            "registry entry reports a different type index",
+        ));
+    }
+    if info.type_depth < 0 {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            "type depth is negative",
+        ));
+    }
+    if info.type_depth != 0 && info.type_acenstors.is_null() {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            "ancestor table is null",
+        ));
+    }
+    Ok(&*(info as *const TVMFFITypeInfo))
+}
+
+/// Return a diagnostic type key without trusting malformed registry strings.
+pub(crate) fn type_key_or_index(type_index: i32) -> String {
+    unsafe {
+        let Ok(info) = checked_type_info(type_index) else {
+            return format!("<type_index {type_index}>");
+        };
+        checked_metadata_str(type_index, "type key", &info.type_key)
+            .map(str::to_owned)
+            .unwrap_or_else(|_| format!("<type_index {type_index}>"))
+    }
+}
+
+unsafe fn checked_type_ancestor_entry(
+    info: &'static TVMFFITypeInfo,
+    ancestors: &'static [*const TVMFFITypeInfo],
+    depth: usize,
+) -> Result<&'static TVMFFITypeInfo> {
+    let Some(&ancestor) = ancestors.get(depth) else {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "ancestor depth is out of range",
+        ));
+    };
+    if ancestor.is_null() {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "ancestor table contains a null entry",
+        ));
+    }
+    if ancestor as usize % std::mem::align_of::<TVMFFITypeInfo>() != 0 {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "ancestor table contains a misaligned entry",
+        ));
+    }
+    let ancestor = &*ancestor;
+    if ancestor.type_depth != depth as i32 {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "ancestor table has an inconsistent depth",
+        ));
+    }
+    if depth == 0 && ancestor.type_index != TypeIndex::kTVMFFIStaticObjectBegin as i32 {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "ancestor table does not start at ffi.Object",
+        ));
+    }
+    if ancestor.type_index >= info.type_index {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "ancestor type index is not older than its descendant",
+        ));
+    }
+    Ok(ancestor)
+}
+
+/// Validate and borrow one entry from a type's ancestor table in O(1).
+pub(crate) unsafe fn checked_type_ancestor(
+    info: &'static TVMFFITypeInfo,
+    depth: usize,
+) -> Result<&'static TVMFFITypeInfo> {
+    let ancestors = checked_metadata_slice(
+        info.type_index,
+        "ancestor",
+        info.type_acenstors,
+        info.type_depth,
+    )?;
+    checked_type_ancestor_entry(info, ancestors, depth)
+}
+
+/// Validate and borrow a type's complete ancestor table.
+pub(crate) unsafe fn checked_type_ancestors(
+    info: &'static TVMFFITypeInfo,
+) -> Result<&'static [*const TVMFFITypeInfo]> {
+    let ancestors = checked_metadata_slice(
+        info.type_index,
+        "ancestor",
+        info.type_acenstors,
+        info.type_depth,
+    )?;
+    for expected_depth in 0..ancestors.len() {
+        checked_type_ancestor_entry(info, ancestors, expected_depth)?;
+    }
+    Ok(ancestors)
+}
+
+/// Validate and borrow one registry entry's field table.
+pub(crate) unsafe fn checked_type_fields(
+    info: &'static TVMFFITypeInfo,
+) -> Result<&'static [TVMFFIFieldInfo]> {
+    checked_metadata_slice(info.type_index, "field", info.fields, info.num_fields)
+}
+
+/// Validate and borrow one registry entry's method table.
+pub(crate) unsafe fn checked_type_methods(
+    info: &'static TVMFFITypeInfo,
+) -> Result<&'static [TVMFFIMethodInfo]> {
+    checked_metadata_slice(info.type_index, "method", info.methods, info.num_methods)
+}
+
+/// Validate and copy one cell from a type-attribute column.
+pub(crate) unsafe fn checked_type_attr(
+    column: *const TVMFFITypeAttrColumn,
+    type_index: i32,
+    attr_name: &str,
+) -> Result<Option<TVMFFIAny>> {
+    if column.is_null() {
+        return Ok(None);
+    }
+    if column as usize % std::mem::align_of::<TVMFFITypeAttrColumn>() != 0 {
+        return Err(invalid_reflection_metadata(
+            type_index,
+            &format!("type attribute `{attr_name}` column is misaligned"),
+        ));
+    }
+    let column = &*column;
+    let cells = checked_metadata_slice(
+        type_index,
+        &format!("type attribute `{attr_name}` column"),
+        column.data,
+        column.size,
+    )?;
+    let offset = i64::from(type_index) - i64::from(column.begin_index);
+    if offset < 0 || offset >= i64::from(column.size) {
+        return Ok(None);
+    }
+    Ok(Some(cells[offset as usize]))
+}
+
+/// Validate and borrow the optional fixed-layout metadata for a type.
+pub(crate) unsafe fn checked_type_metadata(
+    info: &'static TVMFFITypeInfo,
+) -> Result<Option<&'static TVMFFITypeMetadata>> {
+    if info.metadata.is_null() {
+        return Ok(None);
+    }
+    if info.metadata as usize % std::mem::align_of::<TVMFFITypeMetadata>() != 0 {
+        return Err(invalid_reflection_metadata(
+            info.type_index,
+            "object-size metadata is misaligned",
+        ));
+    }
+    Ok(Some(&*info.metadata))
+}
+
+/// Check an object-valued reflection cell before an owning conversion touches
+/// the object's reference count.
+pub(crate) unsafe fn checked_object_cell(data: &TVMFFIAny, label: &str) -> Result<()> {
+    if data.type_index < TypeIndex::kTVMFFIStaticObjectBegin as i32 {
+        return Err(invalid_reflection_metadata(
+            data.type_index,
+            &format!("{label} is not object-valued"),
+        ));
+    }
+    let object = data.data_union.v_obj;
+    if object.is_null() {
+        return Err(invalid_reflection_metadata(
+            data.type_index,
+            &format!("{label} has a null object pointer"),
+        ));
+    }
+    if object as usize % std::mem::align_of::<TVMFFIObject>() != 0 {
+        return Err(invalid_reflection_metadata(
+            data.type_index,
+            &format!("{label} has a misaligned object pointer"),
+        ));
+    }
+    if (*object).type_index != data.type_index {
+        return Err(invalid_reflection_metadata(
+            data.type_index,
+            &format!("{label} disagrees with its object header type"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one reflected field and compute its address within an object.
+pub(crate) unsafe fn checked_field_address(
+    object: *mut TVMFFIObject,
+    owner_info: &'static TVMFFITypeInfo,
+    field: &TVMFFIFieldInfo,
+) -> Result<*mut std::ffi::c_void> {
+    let metadata = checked_type_metadata(owner_info)?.ok_or_else(|| {
+        invalid_reflection_metadata(owner_info.type_index, "object size metadata is missing")
+    })?;
+    let total_size = i64::from(metadata.total_size);
+    let header_size = std::mem::size_of::<TVMFFIObject>() as i64;
+    if total_size < header_size {
+        return Err(invalid_reflection_metadata(
+            owner_info.type_index,
+            "object size is smaller than its header",
+        ));
+    }
+    if field.offset < header_size || field.size < 0 || field.alignment <= 0 {
+        return Err(invalid_reflection_metadata(
+            owner_info.type_index,
+            "field has a negative or header-overlapping layout",
+        ));
+    }
+    let alignment = usize::try_from(field.alignment).map_err(|_| {
+        invalid_reflection_metadata(owner_info.type_index, "field alignment does not fit usize")
+    })?;
+    if !alignment.is_power_of_two() || field.offset % field.alignment != 0 {
+        return Err(invalid_reflection_metadata(
+            owner_info.type_index,
+            "field alignment is invalid",
+        ));
+    }
+    let field_end = field.offset.checked_add(field.size).ok_or_else(|| {
+        invalid_reflection_metadata(owner_info.type_index, "field extent overflows")
+    })?;
+    if field_end > total_size {
+        return Err(invalid_reflection_metadata(
+            owner_info.type_index,
+            "field extends beyond its owner object",
+        ));
+    }
+    let field_ptr = object.cast::<u8>().add(field.offset as usize);
+    if field_ptr as usize % alignment != 0 {
+        return Err(invalid_reflection_metadata(
+            owner_info.type_index,
+            "field address is not correctly aligned",
+        ));
+    }
+    Ok(field_ptr.cast())
 }
 
 /// Read one reflected object field through the runtime's owning getter.
@@ -256,18 +736,11 @@ where
             );
         }
 
-        let owner_info = TVMFFIGetTypeInfo(owner_type_index);
-        if owner_info.is_null() {
-            crate::bail!(
-                crate::error::TYPE_ERROR,
-                "no type info for field owner type_index `{}`",
-                owner_type_index
-            );
-        }
-        let owner_info = &*owner_info;
-        for index in 0..owner_info.num_fields {
-            let field = &*owner_info.fields.add(index as usize);
-            if field.name.as_str() != field_name {
+        let owner_info = checked_type_info(owner_type_index)?;
+        for field in checked_type_fields(owner_info)? {
+            let registered_name =
+                checked_metadata_str(owner_info.type_index, "field name", &field.name)?;
+            if registered_name != field_name {
                 continue;
             }
             let getter = match field.getter {
@@ -280,50 +753,16 @@ where
                     )
                 }
             };
-            if field.offset < 0
-                || field.size < 0
-                || field.alignment <= 0
-                || field.offset % field.alignment != 0
-            {
-                crate::bail!(
-                    crate::error::RUNTIME_ERROR,
-                    "reflected field `{}` has an invalid layout",
-                    field_name
-                );
-            }
-            if !owner_info.metadata.is_null() {
-                let total_size = (*owner_info.metadata).total_size;
-                let field_end = field.offset.checked_add(field.size);
-                if total_size > 0
-                    && match field_end {
-                        Some(end) => end > i64::from(total_size),
-                        None => true,
-                    }
-                {
-                    crate::bail!(
-                        crate::error::RUNTIME_ERROR,
-                        "reflected field `{}` extends beyond its owner object",
-                        field_name
-                    );
-                }
-            }
-            let field_ptr = (header as *mut u8).add(field.offset as usize);
-            if field_ptr as usize % field.alignment as usize != 0 {
-                crate::bail!(
-                    crate::error::RUNTIME_ERROR,
-                    "reflected field `{}` is not correctly aligned",
-                    field_name
-                );
-            }
+            let field_ptr = checked_field_address(header, owner_info, field)?;
             let mut result = TVMFFIAny::new();
-            crate::check_safe_call!(getter(field_ptr.cast(), &mut result))?;
+            crate::check_safe_call!(getter(field_ptr, &mut result))?;
             return Ok(Any::from_raw_ffi_any(result));
         }
         crate::bail!(
             crate::error::ATTRIBUTE_ERROR,
             "field `{}` is not registered on type `{}`",
             field_name,
-            owner_info.type_key.as_str()
+            checked_metadata_str(owner_info.type_index, "type key", &owner_info.type_key)?
         )
     }
 }
@@ -336,15 +775,25 @@ where
     O: ObjectRefCore,
 {
     let owned = get_object_field_any(object, owner_type_index, field_name)?;
-    let converted: TryFromTemp<T> = owned.try_into()?;
-    Ok(TryFromTemp::into_value(converted))
+    owned.try_as::<T>().ok_or_else(|| {
+        crate::error::Error::new(
+            crate::error::TYPE_ERROR,
+            &format!(
+                "reflected field `{field_name}` returned type_index `{}`; expected exact `{}`",
+                owned.type_index(),
+                T::type_str(),
+            ),
+            "",
+        )
+    })
 }
 
-/// Runtime-checked casting between arbitrary `ObjectRef` types.
+/// Runtime-checked casting from an `ObjectRef` into an exact compatible value.
 ///
 /// The cast uses the target's [`AnyCompatible::check_any_strict`] implementation,
-/// mirroring the semantics of `ObjectRef::as<T>` in C++. This supports both
-/// object hierarchies and parameterized object containers.
+/// mirroring the semantics of `ObjectRef::as<T>` in C++. This supports object
+/// hierarchies, parameterized object containers, and checked transparent
+/// refinements that intentionally do not implement [`ObjectRefCore`].
 ///
 /// This trait is blanket-implemented for every [`ObjectRefCore`] type that is
 /// also [`AnyCompatible`].
@@ -353,7 +802,7 @@ pub trait ObjectRefCast: ObjectRefCore + AnyCompatible {
     #[inline(always)]
     fn downcast<B>(&self) -> crate::error::Result<B>
     where
-        B: ObjectRefCore + AnyCompatible,
+        B: AnyCompatible,
     {
         self.clone().try_cast()
     }
@@ -362,7 +811,7 @@ pub trait ObjectRefCast: ObjectRefCore + AnyCompatible {
     #[inline(always)]
     fn try_cast<B>(self) -> crate::error::Result<B>
     where
-        B: ObjectRefCore + AnyCompatible,
+        B: AnyCompatible,
     {
         let mut any_data = TVMFFIAny::new();
         unsafe {
@@ -399,10 +848,38 @@ impl<T: ObjectRefCore + AnyCompatible> ObjectRefCast for T {}
 /// fn require_send<T: Send>() {}
 /// require_send::<tvm_ffi::object::ObjectRef>();
 /// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<tvm_ffi::object::ObjectRef>();
+/// ```
 #[repr(C)]
 #[derive(ObjectRef, Clone)]
 pub struct ObjectRef {
     data: ObjectArc<Object>,
+}
+
+#[repr(C)]
+struct ExtraItemsAllocationHeader {
+    count: usize,
+}
+
+fn extra_items_layout<T, U>(count: usize) -> (std::alloc::Layout, usize) {
+    let (header_and_object, object_offset) =
+        std::alloc::Layout::new::<ExtraItemsAllocationHeader>()
+            .extend(std::alloc::Layout::new::<T>())
+            .expect("allocation header plus object exceeds the maximum allocation size");
+    let items = std::alloc::Layout::array::<U>(count)
+        .expect("extra-item count exceeds the maximum allocation size");
+    let (layout, items_offset) = header_and_object
+        .extend(items)
+        .expect("object plus extra items exceeds the maximum allocation size");
+    assert_eq!(
+        items_offset,
+        object_offset + std::mem::size_of::<T>(),
+        "extra items must be aligned immediately after the object"
+    );
+    (layout.pad_to_align(), object_offset)
 }
 
 /// Unsafe operations on object
@@ -429,8 +906,24 @@ pub mod unsafe_ {
     /// * `obj` - The object to increase the reference count
     #[inline]
     pub unsafe fn inc_ref(handle: *mut TVMFFIObject) {
-        let obj = &mut *handle;
-        obj.combined_ref_count.fetch_add(1, Ordering::Relaxed);
+        let count = &(*handle).combined_ref_count;
+        let mut current = count.load(Ordering::Relaxed);
+        loop {
+            assert_ne!(
+                current & COMBINED_REF_COUNT_MASK_U32,
+                COMBINED_REF_COUNT_MASK_U32,
+                "TVM object strong-reference count overflow"
+            );
+            match count.compare_exchange_weak(
+                current,
+                current + COMBINED_REF_COUNT_STRONG_ONE,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Decrease the strong reference count of the object
@@ -441,15 +934,14 @@ pub mod unsafe_ {
     /// * `obj` - The object to decrease the reference count
     #[inline]
     pub(crate) unsafe fn dec_ref(handle: *mut TVMFFIObject) {
-        let obj = &mut *handle;
-        let old_combined_count = obj
+        let old_combined_count = (*handle)
             .combined_ref_count
-            .fetch_sub(COMBINED_REF_COUNT_STRONG_ONE, Ordering::Relaxed);
+            .fetch_sub(COMBINED_REF_COUNT_STRONG_ONE, Ordering::Release);
         if old_combined_count == COMBINED_REF_COUNT_BOTH_ONE {
-            if let Some(deleter) = obj.deleter {
+            if let Some(deleter) = (*handle).deleter {
                 fence(Ordering::Acquire);
                 deleter(
-                    obj as *mut TVMFFIObject as *mut c_void,
+                    handle.cast::<c_void>(),
                     kTVMFFIObjectDeleterFlagBitMaskBoth as i32,
                 );
             }
@@ -459,20 +951,20 @@ pub mod unsafe_ {
             // slow path, there is still a weak reference left
             // need to run two phase decrement
             fence(Ordering::Acquire);
-            if let Some(deleter) = obj.deleter {
+            if let Some(deleter) = (*handle).deleter {
                 deleter(
-                    obj as *mut TVMFFIObject as *mut c_void,
+                    handle.cast::<c_void>(),
                     kTVMFFIObjectDeleterFlagBitMaskStrong as i32,
                 );
             }
-            let old_weak_count = obj
+            let old_weak_count = (*handle)
                 .combined_ref_count
                 .fetch_sub(COMBINED_REF_COUNT_WEAK_ONE, Ordering::Release);
             if old_weak_count == COMBINED_REF_COUNT_WEAK_ONE {
                 fence(Ordering::Acquire);
-                if let Some(deleter) = obj.deleter {
+                if let Some(deleter) = (*handle).deleter {
                     deleter(
-                        obj as *mut TVMFFIObject as *mut c_void,
+                        handle.cast::<c_void>(),
                         kTVMFFIObjectDeleterFlagBitMaskWeak as i32,
                     );
                 }
@@ -482,26 +974,29 @@ pub mod unsafe_ {
 
     #[inline]
     pub(crate) unsafe fn strong_count(handle: *mut TVMFFIObject) -> usize {
-        let obj = &mut *handle;
-        (obj.combined_ref_count.load(Ordering::Relaxed) & COMBINED_REF_COUNT_MASK_U32) as usize
+        ((*handle).combined_ref_count.load(Ordering::Relaxed) & COMBINED_REF_COUNT_MASK_U32)
+            as usize
     }
 
     #[inline]
     pub(crate) unsafe fn weak_count(handle: *mut TVMFFIObject) -> usize {
-        let obj = &mut *handle;
-        (obj.combined_ref_count.load(Ordering::Relaxed) >> 32) as usize
+        ((*handle).combined_ref_count.load(Ordering::Relaxed) >> 32) as usize
     }
 
     /// Generic object deleter for objects allocated through Rust's global allocator.
     pub(crate) unsafe extern "C" fn object_deleter_for_new<T>(ptr: *mut c_void, flags: i32)
     where
-        T: super::ObjectCore,
+        T: super::RustAllocatableObject,
     {
         let obj = ptr as *mut T;
-        if flags & kTVMFFIObjectDeleterFlagBitMaskStrong as i32 != 0 {
-            std::ptr::drop_in_place(obj);
-        }
-        if flags & kTVMFFIObjectDeleterFlagBitMaskWeak as i32 != 0 {
+        let strong = flags & kTVMFFIObjectDeleterFlagBitMaskStrong as i32 != 0;
+        let weak = flags & kTVMFFIObjectDeleterFlagBitMaskWeak as i32 != 0;
+        if strong && weak {
+            T::drop_payload(obj);
+            std::alloc::dealloc(ptr as *mut u8, std::alloc::Layout::new::<T>());
+        } else if strong {
+            T::drop_payload(obj);
+        } else if weak {
             std::alloc::dealloc(ptr as *mut u8, std::alloc::Layout::new::<T>());
         }
     }
@@ -510,34 +1005,23 @@ pub mod unsafe_ {
         ptr: *mut c_void,
         flags: i32,
     ) where
-        T: super::ObjectCoreWithExtraItems<ExtraItem = U>,
+        T: super::ObjectCoreWithExtraItems<ExtraItem = U> + super::RustAllocatableObject,
     {
         let obj = ptr as *mut T;
-        if flags == kTVMFFIObjectDeleterFlagBitMaskBoth as i32 {
-            let extra_items_count = T::extra_items_count(&(*obj));
-            std::ptr::drop_in_place(obj);
-            let layout = std::alloc::Layout::from_size_align(
-                std::mem::size_of::<T>() + extra_items_count * std::mem::size_of::<U>(),
-                std::mem::align_of::<T>(),
-            )
-            .unwrap();
-            std::alloc::dealloc(ptr as *mut u8, layout);
-        } else {
-            assert_eq!(std::mem::size_of::<T>() % std::mem::size_of::<u64>(), 0);
-            if flags & kTVMFFIObjectDeleterFlagBitMaskStrong as i32 != 0 {
-                let extra_items_count = T::extra_items_count(&(*obj));
-                std::ptr::drop_in_place(obj);
-                std::ptr::write(obj as *mut u64, extra_items_count as u64);
-            }
-            if flags & kTVMFFIObjectDeleterFlagBitMaskWeak as i32 != 0 {
-                let extra_items_count = std::ptr::read(obj as *mut u64) as usize;
-                let layout = std::alloc::Layout::from_size_align(
-                    std::mem::size_of::<T>() + extra_items_count * std::mem::size_of::<U>(),
-                    std::mem::align_of::<T>(),
-                )
-                .unwrap();
-                std::alloc::dealloc(ptr as *mut u8, layout);
-            }
+        let strong = flags & kTVMFFIObjectDeleterFlagBitMaskStrong as i32 != 0;
+        let weak = flags & kTVMFFIObjectDeleterFlagBitMaskWeak as i32 != 0;
+        let (_, object_offset) = super::extra_items_layout::<T, U>(0);
+        let allocation = (obj as *mut u8).sub(object_offset);
+        let extra_items_count = (*(allocation.cast::<super::ExtraItemsAllocationHeader>())).count;
+        let (layout, expected_offset) = super::extra_items_layout::<T, U>(extra_items_count);
+        debug_assert_eq!(object_offset, expected_offset);
+        if strong && weak {
+            T::drop_payload(obj);
+            std::alloc::dealloc(allocation, layout);
+        } else if strong {
+            T::drop_payload(obj);
+        } else if weak {
+            std::alloc::dealloc(allocation, layout);
         }
     }
 }
@@ -558,6 +1042,7 @@ impl Object {
 unsafe impl ObjectCore for Object {
     const TYPE_KEY: &'static str = "ffi.Object";
     const TYPE_DEPTH: i32 = 0;
+    const TYPE_INDEX_STATIC: bool = true;
     #[inline]
     fn type_index() -> i32 {
         TypeIndex::kTVMFFIStaticObjectBegin as i32
@@ -566,6 +1051,10 @@ unsafe impl ObjectCore for Object {
     unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
         &mut this.header
     }
+}
+
+unsafe impl RustAllocatableObject for Object {
+    unsafe fn drop_payload(_this: *mut Self) {}
 }
 
 //---------------------
@@ -579,7 +1068,11 @@ impl<T: ObjectCore> ObjectArc<T> {
         this.ptr.cast::<()>() == other.ptr.cast::<()>()
     }
 
-    pub fn new(data: T) -> Self {
+    pub fn new(data: T) -> Self
+    where
+        T: RustAllocatableObject,
+    {
+        let type_index = T::type_index();
         unsafe {
             let layout = std::alloc::Layout::new::<T>();
             let raw_data_ptr = std::alloc::alloc(layout);
@@ -593,7 +1086,7 @@ impl<T: ObjectCore> ObjectArc<T> {
                 ptr as *mut TVMFFIObject,
                 TVMFFIObject {
                     combined_ref_count: AtomicU64::new(COMBINED_REF_COUNT_BOTH_ONE),
-                    type_index: T::type_index(),
+                    type_index,
                     __padding: 0,
                     deleter: Some(unsafe_::object_deleter_for_new::<T>),
                 },
@@ -607,31 +1100,30 @@ impl<T: ObjectCore> ObjectArc<T> {
     }
     pub fn new_with_extra_items<U>(data: T) -> Self
     where
-        T: ObjectCoreWithExtraItems<ExtraItem = U>,
+        T: ObjectCoreWithExtraItems<ExtraItem = U> + RustAllocatableObject,
     {
+        let type_index = T::type_index();
         unsafe {
-            // ensure strict alignment requirements
-            // so we can have { T, U*extra_items } layout
-            assert_eq!(std::mem::align_of::<T>() % std::mem::align_of::<U>(), 0);
-            assert_eq!(std::mem::size_of::<T>() % std::mem::align_of::<U>(), 0);
             let extra_items_count = T::extra_items_count(&data);
-            let layout = std::alloc::Layout::from_size_align(
-                std::mem::size_of::<T>() + extra_items_count * std::mem::size_of::<U>(),
-                std::mem::align_of::<T>(),
-            )
-            .unwrap();
+            let (layout, object_offset) = extra_items_layout::<T, U>(extra_items_count);
             let raw_data_ptr = std::alloc::alloc(layout);
             if raw_data_ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            let ptr = raw_data_ptr as *mut T;
+            std::ptr::write(
+                raw_data_ptr.cast::<ExtraItemsAllocationHeader>(),
+                ExtraItemsAllocationHeader {
+                    count: extra_items_count,
+                },
+            );
+            let ptr = raw_data_ptr.add(object_offset).cast::<T>();
             std::ptr::write(ptr, data);
             // now override the header directly
             std::ptr::write(
                 ptr as *mut TVMFFIObject,
                 TVMFFIObject {
                     combined_ref_count: AtomicU64::new(COMBINED_REF_COUNT_BOTH_ONE),
-                    type_index: T::type_index(),
+                    type_index,
                     __padding: 0,
                     deleter: Some(unsafe_::object_deleter_for_new_with_extra_items::<T, U>),
                 },
@@ -774,5 +1266,107 @@ impl<T: ObjectCore> Clone for ObjectArc<T> {
             ptr: self.ptr,
             _phantom: std::marker::PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn byte_array(value: &'static str) -> TVMFFIByteArray {
+        unsafe { TVMFFIByteArray::from_str(value) }
+    }
+
+    fn type_info() -> TVMFFITypeInfo {
+        TVMFFITypeInfo {
+            type_index: 1234,
+            type_depth: 0,
+            type_key: byte_array("testing.MetadataFixture"),
+            type_acenstors: std::ptr::null(),
+            type_key_hash: 0,
+            num_fields: 0,
+            num_methods: 0,
+            fields: std::ptr::null(),
+            methods: std::ptr::null(),
+            metadata: std::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn metadata_strings_reject_null_and_invalid_utf8() {
+        let null_data = TVMFFIByteArray::new(std::ptr::null(), 1);
+        assert!(unsafe { checked_metadata_str(1234, "method name", &null_data) }.is_err());
+
+        let invalid_utf8 = [0xff];
+        let invalid = TVMFFIByteArray::new(invalid_utf8.as_ptr(), invalid_utf8.len());
+        assert!(unsafe { checked_metadata_str(1234, "method name", &invalid) }.is_err());
+
+        let empty = TVMFFIByteArray::new(std::ptr::null(), 0);
+        assert_eq!(
+            unsafe { checked_metadata_str(1234, "method name", &empty) }.unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn method_and_metadata_tables_reject_invalid_observable_shapes() {
+        let info = Box::leak(Box::new(type_info()));
+        info.num_methods = -1;
+        assert!(unsafe { checked_type_methods(info) }.is_err());
+
+        let info = Box::leak(Box::new(type_info()));
+        info.num_methods = 1;
+        assert!(unsafe { checked_type_methods(info) }.is_err());
+
+        let info = Box::leak(Box::new(type_info()));
+        info.num_methods = 1;
+        info.methods = 1usize as *const TVMFFIMethodInfo;
+        assert!(unsafe { checked_type_methods(info) }.is_err());
+
+        let info = Box::leak(Box::new(type_info()));
+        info.metadata = 1usize as *const TVMFFITypeMetadata;
+        assert!(unsafe { checked_type_metadata(info) }.is_err());
+    }
+
+    #[test]
+    fn type_attribute_lookup_handles_extreme_indices_and_invalid_tables() {
+        let cells = Box::leak(Box::new([TVMFFIAny::new()]));
+        let mut column = TVMFFITypeAttrColumn {
+            data: cells.as_ptr(),
+            size: 1,
+            begin_index: i32::MIN,
+        };
+
+        // The i32 subtraction in the old lookup overflowed for this pair.
+        assert!(
+            unsafe { checked_type_attr(&column, i32::MAX, "__ffi_init__") }
+                .unwrap()
+                .is_none()
+        );
+
+        column.size = -1;
+        assert!(unsafe { checked_type_attr(&column, 0, "__ffi_init__") }.is_err());
+
+        column.size = 1;
+        column.data = std::ptr::null();
+        assert!(unsafe { checked_type_attr(&column, 0, "__ffi_init__") }.is_err());
+
+        assert!(unsafe {
+            checked_type_attr(1usize as *const TVMFFITypeAttrColumn, 0, "__ffi_init__")
+        }
+        .is_err());
+    }
+
+    #[test]
+    fn object_cells_are_checked_before_refcount_access() {
+        let mut cell = TVMFFIAny::new();
+        cell.type_index = TypeIndex::kTVMFFIFunction as i32;
+        cell.data_union.v_obj = std::ptr::null_mut();
+        assert!(unsafe { checked_object_cell(&cell, "Function cell") }.is_err());
+
+        let mut header = TVMFFIObject::new();
+        header.type_index = TypeIndex::kTVMFFIStaticObjectBegin as i32;
+        cell.data_union.v_obj = &mut header;
+        assert!(unsafe { checked_object_cell(&cell, "Function cell") }.is_err());
     }
 }

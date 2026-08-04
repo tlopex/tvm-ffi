@@ -19,22 +19,68 @@
 use tvm_ffi::collections::array::ArrayObj;
 use tvm_ffi::*;
 
+#[derive(Clone)]
+struct PanicOnMove {
+    value: AnyValue,
+    panic_on_move: bool,
+}
+
+unsafe impl AnyCompatible for PanicOnMove {
+    fn type_str() -> std::string::String {
+        AnyValue::type_str()
+    }
+
+    unsafe fn copy_to_any_view(src: &Self, data: &mut TVMFFIAny) {
+        unsafe { AnyValue::copy_to_any_view(&src.value, data) };
+    }
+
+    unsafe fn move_to_any(src: Self, data: &mut TVMFFIAny) {
+        if src.panic_on_move {
+            panic!("injected Array element-conversion failure");
+        }
+        unsafe { AnyValue::move_to_any(src.value, data) };
+    }
+
+    unsafe fn check_any_strict(data: &TVMFFIAny) -> bool {
+        unsafe { AnyValue::check_any_strict(data) }
+    }
+
+    unsafe fn copy_from_any_view_after_check(data: &TVMFFIAny) -> Self {
+        Self {
+            value: unsafe { AnyValue::copy_from_any_view_after_check(data) },
+            panic_on_move: false,
+        }
+    }
+
+    unsafe fn move_from_any_after_check(data: &mut TVMFFIAny) -> Self {
+        Self {
+            value: unsafe { AnyValue::move_from_any_after_check(data) },
+            panic_on_move: false,
+        }
+    }
+
+    unsafe fn try_cast_from_any_view(data: &TVMFFIAny) -> std::result::Result<Self, ()> {
+        Ok(Self {
+            value: unsafe { AnyValue::try_cast_from_any_view(data)? },
+            panic_on_move: false,
+        })
+    }
+}
+
 /// Helper to create a Tensor with a specific float value and shape
 fn create_tensor(val: f32, shape: &[i64]) -> Tensor {
     let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
     let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
-    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, shape, dtype, device);
-    if let Ok(slice) = tensor.data_as_slice_mut::<f32>() {
-        slice[0] = val;
-    }
+    let mut tensor = Tensor::from_nd_alloc(CPUNDAlloc::default(), shape, dtype, device);
+    // The freshly allocated test Tensor has no other data owner or view.
+    unsafe { tensor.data_as_slice_mut_unchecked::<f32>() }.unwrap()[0] = val;
     tensor
 }
 
 /// Helper to extract the first float value from a Tensor
 fn get_val(tensor: &Tensor) -> f32 {
-    tensor
-        .data_as_slice::<f32>()
-        .expect("Type mismatch or null")[0]
+    // Test fixtures do not expose their CPU buffers to another owner.
+    unsafe { tensor.data_as_slice_unchecked::<f32>() }.expect("Type mismatch or null")[0]
 }
 
 #[test]
@@ -60,6 +106,57 @@ fn test_array_core_and_iteration() {
     // Iteration
     let vals: Vec<f32> = array.iter().map(|t| get_val(&t)).collect();
     assert_eq!(vals, vec![10.0, 20.0]);
+}
+
+#[test]
+fn test_array_drop_releases_object_elements_once() {
+    let tensor = create_tensor(10.0, &[1]);
+    let base = AnyView::from(&tensor)
+        .debug_strong_count()
+        .expect("tensor is reference counted");
+
+    let array = Array::new(vec![tensor.clone(), tensor.clone()]);
+    assert_eq!(AnyView::from(&tensor).debug_strong_count(), Some(base + 2));
+
+    // Array clones share one container, so a non-final drop must not release
+    // its elements. The final drop releases each of the two owning slots once.
+    let array_clone = array.clone();
+    drop(array);
+    assert_eq!(AnyView::from(&tensor).debug_strong_count(), Some(base + 2));
+    drop(array_clone);
+    assert_eq!(AnyView::from(&tensor).debug_strong_count(), Some(base));
+}
+
+#[test]
+fn test_array_partial_initialization_releases_completed_elements() {
+    let tensor = create_tensor(20.0, &[1]);
+    let base = AnyView::from(&tensor)
+        .debug_strong_count()
+        .expect("tensor is reference counted");
+    let items = vec![
+        PanicOnMove {
+            value: AnyValue::from_value(tensor.clone()),
+            panic_on_move: false,
+        },
+        PanicOnMove {
+            value: AnyValue::from_value(tensor.clone()),
+            panic_on_move: true,
+        },
+        PanicOnMove {
+            value: AnyValue::from_value(tensor.clone()),
+            panic_on_move: false,
+        },
+    ];
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = Array::new(items);
+    }));
+    assert!(result.is_err());
+
+    // The first item was already moved into the trailing buffer. The failing
+    // item and untouched suffix unwind from the input Vec; all three references
+    // must be gone after construction fails.
+    assert_eq!(AnyView::from(&tensor).debug_strong_count(), Some(base));
 }
 
 #[test]
@@ -103,7 +200,7 @@ fn test_null_array_encodes_as_ffi_none() {
 }
 
 #[test]
-fn test_array_recursive_type_checking() {
+fn test_array_rejects_incompatible_element_type() {
     // 1. Create an Array of Shapes
     let shape_array = Array::new(vec![Shape::from(vec![1, 2]), Shape::from(vec![3])]);
 
@@ -127,8 +224,7 @@ fn test_array_recursive_type_checking() {
 }
 
 #[test]
-fn test_array_parametric_heterogeneity() {
-    // Verify Array works with different ObjectRefCore types
+fn test_array_supports_distinct_homogeneous_object_types() {
     let shape_array = Array::new(vec![Shape::from(vec![1, 2, 3]), Shape::from(vec![10])]);
     assert_eq!(shape_array.get(0).unwrap().as_slice(), &[1, 2, 3]);
     assert_eq!(shape_array.get(1).unwrap().as_slice(), &[10]);

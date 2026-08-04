@@ -17,7 +17,7 @@
  * under the License.
  */
 use crate::derive::{Object, ObjectRef};
-use crate::object::{Object, ObjectArc, ObjectCoreWithExtraItems};
+use crate::object::{Object, ObjectArc, ObjectCoreWithExtraItems, RustAllocatableObject};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
 use std::ops::Deref;
 use tvm_ffi_sys::TVMFFIShapeCell;
@@ -34,6 +34,10 @@ use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 pub struct ShapeObj {
     object: Object,
     data: TVMFFIShapeCell,
+}
+
+unsafe impl RustAllocatableObject for ShapeObj {
+    unsafe fn drop_payload(_this: *mut Self) {}
 }
 
 /// ABI stable owned Shape for ffi
@@ -60,7 +64,15 @@ impl Shape {
 
     /// Get the shape as a slice
     pub fn as_slice(&self) -> &[i64] {
-        unsafe { std::slice::from_raw_parts(self.data.data.data, self.data.data.size) }
+        if self.data.data.size == 0 {
+            &[]
+        } else {
+            assert!(
+                !self.data.data.data.is_null(),
+                "non-empty Shape has null data"
+            );
+            unsafe { std::slice::from_raw_parts(self.data.data.data, self.data.data.size) }
+        }
     }
 
     /// Fill the strides from the shape
@@ -72,7 +84,9 @@ impl Shape {
         let mut stride = 1;
         for i in (0..shape.len()).rev() {
             strides[i] = stride;
-            stride *= shape[i];
+            stride = stride
+                .checked_mul(shape[i])
+                .expect("shape strides exceed i64::MAX");
         }
     }
 }
@@ -100,9 +114,12 @@ where
             });
             // reset the data ptr correctly after Arc is created
             let obj = &mut *ObjectArc::as_raw_mut(&mut obj_arc);
-            obj.data.data = ShapeObj::extra_items(obj).as_ptr();
-            let extra_items = ShapeObj::extra_items_mut(obj);
-            extra_items.copy_from_slice(value_slice);
+            let extra_items = ShapeObj::extra_items_uninit_mut(obj);
+            let data = extra_items.as_mut_ptr().cast::<i64>();
+            for (slot, value) in extra_items.iter_mut().zip(value_slice) {
+                slot.write(*value);
+            }
+            obj.data.data = data;
             Self { data: obj_arc }
         }
     }

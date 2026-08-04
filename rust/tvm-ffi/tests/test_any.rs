@@ -64,6 +64,14 @@ macro_rules! test_any_float {
                 assert_eq!(any.type_index(), TypeIndex::kTVMFFIFloat as i32);
                 assert_eq!(<$type>::try_from(any).unwrap(), $value);
             }
+
+            #[test]
+            fn $any_view_name() {
+                let value = $value;
+                let any_view = AnyView::from(&value);
+                assert_eq!(any_view.type_index(), TypeIndex::kTVMFFIFloat as i32);
+                assert_eq!(<$type>::try_from(any_view).unwrap(), $value);
+            }
         )*
     };
 }
@@ -99,16 +107,10 @@ fn test_any_bool() {
 }
 
 #[test]
-fn test_type_mismatch_error() {
-    let any = Any::from(42i32);
-    // try from will try casting when possible
-    // Try to convert int to bool - should be ok
-    let result: Result<bool, _> = bool::try_from(any);
-    assert!(result.is_ok());
-    // try_as is more strict and do not allow conversion from int to bool
-    let any = Any::from(42i32);
-    let opt_try_as = any.try_as::<bool>();
-    assert!(opt_try_as.is_none());
+fn test_int_to_bool_is_allowed_only_by_converting_extraction() {
+    assert!(bool::try_from(Any::from(42_i32)).unwrap());
+    assert!(!bool::try_from(Any::from(0_i32)).unwrap());
+    assert!(Any::from(42_i32).try_as::<bool>().is_none());
 }
 
 #[test]
@@ -127,19 +129,15 @@ fn test_type_mismatch_error_message() {
 }
 
 #[test]
-fn test_cross_type_conversion_int_to_bool() {
-    // Test that integers can be converted to bool (0 = false, non-zero = true)
-    let any_true = Any::from(42i32);
-    let any_false = Any::from(0i32);
-
-    // This should work because our macro allows conversion from int to bool
-    let bool_true: Result<bool, _> = bool::try_from(any_true);
-    let bool_false: Result<bool, _> = bool::try_from(any_false);
-
-    // Note: This test might fail depending on how try_cast_from_any_view is implemented
-    // If it fails, it means the conversion isn't implemented yet
-    assert_eq!(bool_true.unwrap(), true);
-    assert_eq!(bool_false.unwrap(), false);
+fn unregistered_non_object_type_mismatch_is_a_normal_error() {
+    let mut raw = tvm_ffi_sys::TVMFFIAny::new();
+    // This tag is below the object range, so it owns no object pointer, but it
+    // has no TypeInfo entry from which to obtain a diagnostic type key.
+    raw.type_index = TypeIndex::kTVMFFIStaticObjectBegin as i32 - 1;
+    let any = unsafe { Any::from_raw_ffi_any(raw) };
+    let error = String::try_from(any).unwrap_err();
+    assert_eq!(error.kind(), TYPE_ERROR);
+    assert!(error.message().contains("<type_index 63>"));
 }
 
 #[test]
@@ -307,6 +305,12 @@ fn test_anyview_any_conversion_and_cloning() {
 
     drop(any3);
     assert_eq!(AnyView::from(&input_str).debug_strong_count(), Some(5));
+
+    drop(out_string1);
+    drop(out_string2);
+    drop(out_string3);
+    drop(out_string_view);
+    assert_eq!(AnyView::from(&input_str).debug_strong_count(), Some(1));
 }
 
 #[test]
@@ -360,4 +364,19 @@ fn test_any_value_preserves_heterogeneous_array_elements() {
 
     let second = values.get(1).unwrap().into_any();
     assert_eq!(second.try_as::<String>().unwrap(), String::from("hello"));
+}
+
+#[test]
+fn strict_extraction_rejects_conversion_fallbacks() {
+    let relaxed = i64::try_from(Any::from(true)).unwrap();
+    assert_eq!(relaxed, 1);
+
+    let error = Any::from(true).try_into_strict::<i64>().unwrap_err();
+    assert_eq!(error.kind(), TYPE_ERROR);
+
+    let bools = Array::new(vec![true, false]);
+    let error = Any::from(bools)
+        .try_into_strict::<Array<i64>>()
+        .expect_err("reflected Array<i64> must not accept Array<bool>");
+    assert_eq!(error.kind(), TYPE_ERROR);
 }

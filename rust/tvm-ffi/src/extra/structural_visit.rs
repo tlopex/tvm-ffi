@@ -56,21 +56,23 @@
 
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
-use std::os::raw::c_void;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::any::{Any, AnyView};
 use crate::error::{Error, Result, RUNTIME_ERROR, TYPE_ERROR};
 use crate::function::Function;
-use crate::object::ObjectCore;
+use crate::object::{
+    checked_field_address, checked_metadata_str, checked_object_cell, checked_type_ancestors,
+    checked_type_attr, checked_type_fields, checked_type_info, checked_type_metadata,
+    type_key_or_index, ObjectCore,
+};
 use crate::tvm_ffi_sys::TVMFFIFieldFlagBitMask::{
     kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive, kTVMFFIFieldFlagBitMaskSEqHashDefRecursive,
     kTVMFFIFieldFlagBitMaskSEqHashIgnore,
 };
 use crate::tvm_ffi_sys::{
     TVMFFIAny, TVMFFIByteArray, TVMFFIDefRegionKind, TVMFFIFieldInfo, TVMFFIGetTypeAttrColumn,
-    TVMFFIGetTypeInfo, TVMFFIObject, TVMFFISEqHashKind, TVMFFITypeAttrColumn, TVMFFITypeIndex,
+    TVMFFIObject, TVMFFISEqHashKind, TVMFFITypeAttrColumn, TVMFFITypeIndex, TVMFFITypeInfo,
 };
 
 const STRUCTURAL_VISIT_ATTR: &str = "__s_visit__";
@@ -226,7 +228,7 @@ impl VisitValue {
             if N::TYPE_FINAL {
                 return None;
             }
-            if !is_instance_at_depth(self.0.type_index, base_type_index, N::TYPE_DEPTH) {
+            if !crate::object::is_instance_of_index(self.0.type_index, base_type_index) {
                 return None;
             }
         }
@@ -951,16 +953,6 @@ fn visit_children_raw<C: ChildVisit>(
         x if x == TVMFFITypeIndex::kTVMFFIMap as i32
             || x == TVMFFITypeIndex::kTVMFFIDict as i32 =>
         {
-            // Fast path: read the MapBaseObj storage layout directly, like
-            // the SeqPrefix path for arrays — zero FFI calls per entry.
-            // Dict entries are snapshotted first to keep the re-entrant
-            // mutation guard. If the one-time layout validation fails
-            // (e.g. an ABI-debug build), fall back to the packed-functor
-            // iteration protocol.
-            if map_layout_usable(value) {
-                let snapshot = x == TVMFFITypeIndex::kTVMFFIDict as i32;
-                return visit_map_layout(value, visitor, def_region_kind, snapshot);
-            }
             return visit_map(value, visitor, def_region_kind);
         }
         _ => {}
@@ -1025,69 +1017,10 @@ fn visit_sequence<C: ChildVisit>(
     Ok(())
 }
 
-/// Walk map/dict entries by reading the `MapBaseObj` storage directly —
-/// the map analog of the `SeqPrefix` array fast path. `snapshot` first
-/// takes owned copies of all entries (Dict re-entrant mutation guard).
-#[inline(never)]
-fn visit_map_layout<C: ChildVisit>(
-    value: TVMFFIAny,
-    visitor: &mut C,
-    def_region_kind: DefRegionKind,
-    snapshot: bool,
-) -> NativeResult {
-    let map = unsafe { &*(value.data_union.v_obj as *const MapPrefix) };
-    let size = map.size as usize;
-    if size == 0 {
-        return Ok(());
-    }
-    let mut cursor = unsafe { MapCursor::new(map) };
-
-    if snapshot {
-        let mut entries: Vec<(Any, Any)> = Vec::with_capacity(size);
-        for _ in 0..size {
-            let Some((key, val)) = (unsafe { cursor.next() }) else {
-                return Err(runtime_error("native visitor: map iteration ended early").into());
-            };
-            entries.push((
-                Any::from(unsafe { view_of(&key) }),
-                Any::from(unsafe { view_of(&val) }),
-            ));
-        }
-        for (index, (key, val)) in entries.into_iter().enumerate() {
-            visitor
-                .visit_child(raw_of_owned(&key), def_region_kind)
-                .map_err(|halt| with_error_context(halt, &format!("dict key [{index}]")))?;
-            visitor
-                .visit_child(raw_of_owned(&val), def_region_kind)
-                .map_err(|halt| with_error_context(halt, &format!("dict value [{index}]")))?;
-        }
-        return Ok(());
-    }
-
-    // Immutable map: entry cells stay stable throughout recursive
-    // callbacks, so visit them in place. The `size` bound also guards the
-    // dense iteration list against corruption-induced cycles.
-    for index in 0..size {
-        let Some((key, val)) = (unsafe { cursor.next() }) else {
-            return Err(runtime_error("native visitor: map iteration ended early").into());
-        };
-        visitor
-            .visit_child(key, def_region_kind)
-            .map_err(|halt| with_error_context(halt, &format!("map key [{index}]")))?;
-        visitor
-            .visit_child(val, def_region_kind)
-            .map_err(|halt| with_error_context(halt, &format!("map value [{index}]")))?;
-    }
-    Ok(())
-}
-
-/// Cold fallback used when the mirrored layout fails validation (e.g. an
-/// ABI-debug build): iterate through the public packed functors. Map storage
-/// is private C++; the Rust binding itself uses these iterator functors, so
-/// no structural visiting or traversal control leaves Rust. Entries are
-/// snapshotted before user callbacks run — required for Dict, whose mutation
-/// invalidates the iterator, and harmless for immutable Map on this
-/// non-performance path.
+/// Walk map/dict entries through the public packed iterator API. Map storage is
+/// private C++, so Rust must not mirror the small/dense hash-table layouts.
+/// Entries are snapshotted before user callbacks run — required for Dict,
+/// whose mutation invalidates the iterator, and harmless for immutable Map.
 fn visit_map<C: ChildVisit>(
     value: TVMFFIAny,
     visitor: &mut C,
@@ -1141,37 +1074,32 @@ fn visit_reflected_fields<C: ChildVisit>(
     visitor: &mut C,
     def_region_kind: DefRegionKind,
 ) -> NativeResult {
-    let type_info = unsafe { TVMFFIGetTypeInfo(value.type_index) };
-    if type_info.is_null() {
-        return Err(runtime_error(&format!(
-            "native visitor: unregistered type index {}",
-            value.type_index
-        ))
-        .into());
-    }
-    let seq_hash_kind = unsafe {
-        let metadata = (*type_info).metadata;
-        if metadata.is_null() {
-            TVMFFISEqHashKind::kTVMFFISEqHashKindUnsupported as i32
-        } else {
-            (*metadata).structural_eq_hash_kind
-        }
-    };
+    let type_info = unsafe { checked_type_info(value.type_index) }.map_err(NativeHalt::Error)?;
+    let seq_hash_kind = unsafe { checked_type_metadata(type_info) }
+        .map_err(NativeHalt::Error)?
+        .map_or(
+            TVMFFISEqHashKind::kTVMFFISEqHashKindUnsupported as i32,
+            |metadata| metadata.structural_eq_hash_kind,
+        );
     let def_region_kind = free_var_child_region(def_region_kind, seq_hash_kind);
-    let object = unsafe { value.data_union.v_obj } as *mut u8;
+    unsafe { checked_object_cell(&value, "structural-visit object cell") }
+        .map_err(NativeHalt::Error)?;
+    let object = unsafe { value.data_union.v_obj };
     let halted = unsafe {
-        for_each_field(value.type_index, |field| {
-            match visit_reflected_field(object, field, visitor, def_region_kind) {
+        for_each_field(type_info, |owner_info, field| {
+            match visit_reflected_field(object, owner_info, field, visitor, def_region_kind) {
                 Ok(()) => ControlFlow::Continue(()),
                 Err(halt) => ControlFlow::Break(halt),
             }
         })
-    };
+    }
+    .map_err(NativeHalt::Error)?;
     halted.map_or(Ok(()), Err)
 }
 
 unsafe fn visit_reflected_field<C: ChildVisit>(
-    object: *mut u8,
+    object: *mut TVMFFIObject,
+    owner_info: &'static TVMFFITypeInfo,
     field: &TVMFFIFieldInfo,
     visitor: &mut C,
     inherited_region: DefRegionKind,
@@ -1180,18 +1108,21 @@ unsafe fn visit_reflected_field<C: ChildVisit>(
         return Ok(());
     }
 
+    let field_name = checked_metadata_str(owner_info.type_index, "field name", &field.name)
+        .map_err(NativeHalt::Error)?;
+
     let Some(getter) = field.getter else {
         return Err(NativeHalt::Error(runtime_error(&format!(
             "native visitor: reflected field `{}` has no getter",
-            field.name.as_str()
+            field_name
         ))));
     };
-    let address = object.offset(field.offset as isize) as *mut c_void;
+    let address = checked_field_address(object, owner_info, field).map_err(NativeHalt::Error)?;
     let mut child_raw = TVMFFIAny::new();
     if getter(address, &mut child_raw) != 0 {
         return Err(with_error_context(
             NativeHalt::Error(Error::from_raised()),
-            &format!("field `{}`", field.name.as_str()),
+            &format!("field `{field_name}`"),
         ));
     }
 
@@ -1202,7 +1133,7 @@ unsafe fn visit_reflected_field<C: ChildVisit>(
     let child_region = field_def_region(field, inherited_region);
     visitor
         .visit_child(borrowed, child_region)
-        .map_err(|halt| with_error_context(halt, &format!("field `{}`", field.name.as_str())))
+        .map_err(|halt| with_error_context(halt, &format!("field `{field_name}`")))
 }
 
 // Runs once per visited value: keep the no-hook fast path small enough to
@@ -1211,7 +1142,11 @@ unsafe fn visit_reflected_field<C: ChildVisit>(
 // was declined and the call cost ~20% of the container fast path.
 #[inline]
 fn reject_foreign_structural_visit(type_index: i32) -> Result<()> {
-    let Some(attr) = structural_visit_column().and_then(|column| column.get(type_index)) else {
+    let Some(column) = structural_visit_column() else {
+        return Ok(());
+    };
+    let Some(attr) = (unsafe { checked_type_attr(column, type_index, STRUCTURAL_VISIT_ATTR) })?
+    else {
         return Ok(());
     };
     if attr.type_index == TVMFFITypeIndex::kTVMFFINone as i32 {
@@ -1344,148 +1279,6 @@ fn runtime_error(message: &str) -> Error {
     Error::new(RUNTIME_ERROR, message, "")
 }
 
-/// Layout prefix shared by the C++ `MapObj` and `DictObj` (`MapBaseObj`,
-/// release ABI without `TVM_FFI_DEBUG_WITH_ABI_CHANGE`).
-#[repr(C)]
-struct MapPrefix {
-    _header: TVMFFIObject,
-    data: *mut u8,
-    size: u64,
-    slots: u64,
-    _data_deleter: Option<unsafe extern "C" fn(*mut c_void)>,
-}
-
-/// Dense-layout extension of the prefix (`DenseMapBaseObj`).
-#[repr(C)]
-struct DenseMapPrefix {
-    base: MapPrefix,
-    fib_shift: u32,
-    iter_list_head: u64,
-    iter_list_tail: u64,
-}
-
-const _: () = {
-    assert!(std::mem::offset_of!(MapPrefix, data) == 24);
-    assert!(std::mem::offset_of!(MapPrefix, size) == 32);
-    assert!(std::mem::offset_of!(MapPrefix, slots) == 40);
-    assert!(std::mem::offset_of!(MapPrefix, _data_deleter) == 48);
-    assert!(std::mem::offset_of!(DenseMapPrefix, fib_shift) == 56);
-    assert!(std::mem::offset_of!(DenseMapPrefix, iter_list_head) == 64);
-};
-
-/// MSB tag on `slots_` marking the small (inline KV array) layout.
-const MAP_SMALL_TAG: u64 = 1 << 63;
-/// `kInvalidIndex`: terminator of the dense iteration list.
-const MAP_INVALID_INDEX: u64 = u64::MAX;
-/// `kBlockCap`: entries per dense block.
-const MAP_BLOCK_CAP: u64 = 16;
-/// `sizeof(ItemType)`: KV pair (32 bytes) + prev/next indices (16 bytes).
-const MAP_ITEM_SIZE: usize = 48;
-/// `sizeof(Block)`: `kBlockCap` metadata bytes + `kBlockCap` items.
-const MAP_BLOCK_SIZE: usize = 16 + 16 * MAP_ITEM_SIZE;
-/// Byte offset of `ItemType::next` (after the 32-byte KV pair and `prev`).
-const MAP_ITEM_NEXT_OFFSET: usize = 40;
-
-/// Borrowed traversal cursor over either map storage layout, yielding entries
-/// in the same order as the C++ iterator.
-enum MapCursor {
-    Small {
-        kv: *const TVMFFIAny,
-        index: usize,
-        size: usize,
-    },
-    Dense {
-        data: *const u8,
-        index: u64,
-    },
-}
-
-impl MapCursor {
-    #[inline]
-    unsafe fn new(map: &MapPrefix) -> MapCursor {
-        if map.slots & MAP_SMALL_TAG != 0 {
-            MapCursor::Small {
-                kv: map.data as *const TVMFFIAny,
-                index: 0,
-                size: map.size as usize,
-            }
-        } else {
-            let dense = &*(map as *const MapPrefix as *const DenseMapPrefix);
-            MapCursor::Dense {
-                data: map.data,
-                index: dense.iter_list_head,
-            }
-        }
-    }
-
-    #[inline]
-    unsafe fn next(&mut self) -> Option<(TVMFFIAny, TVMFFIAny)> {
-        match self {
-            MapCursor::Small { kv, index, size } => {
-                if *index >= *size {
-                    return None;
-                }
-                let pair = kv.add(*index * 2);
-                *index += 1;
-                Some((*pair, *pair.add(1)))
-            }
-            MapCursor::Dense { data, index } => {
-                if *index == MAP_INVALID_INDEX {
-                    return None;
-                }
-                let block = data.add((*index / MAP_BLOCK_CAP) as usize * MAP_BLOCK_SIZE);
-                let item = block.add(
-                    MAP_BLOCK_CAP as usize + (*index % MAP_BLOCK_CAP) as usize * MAP_ITEM_SIZE,
-                );
-                let key = *(item as *const TVMFFIAny);
-                let val = *(item.add(16) as *const TVMFFIAny);
-                *index = *(item.add(MAP_ITEM_NEXT_OFFSET) as *const u64);
-                Some((key, val))
-            }
-        }
-    }
-}
-
-/// Process-wide result of the one-time map layout validation:
-/// 0 = unknown, 1 = usable, 2 = unusable.
-static MAP_LAYOUT_STATE: AtomicU8 = AtomicU8::new(0);
-
-#[inline]
-fn map_layout_usable(value: TVMFFIAny) -> bool {
-    match MAP_LAYOUT_STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let usable = validate_map_layout(value);
-            MAP_LAYOUT_STATE.store(if usable { 1 } else { 2 }, Ordering::Relaxed);
-            usable
-        }
-    }
-}
-
-/// Cross-check the mirrored `MapBaseObj` layout against the public size
-/// functor once per process. An ABI-debug build inserts a state marker that
-/// shifts every field by 8 bytes, which this detects: offset 32 then holds a
-/// pointer value that cannot equal the reported entry count.
-fn validate_map_layout(value: TVMFFIAny) -> bool {
-    let expected = (|| -> Result<i64> {
-        let is_dict = value.type_index == TVMFFITypeIndex::kTVMFFIDict as i32;
-        let name = if is_dict {
-            "ffi.DictSize"
-        } else {
-            "ffi.MapSize"
-        };
-        Function::get_global(name)?
-            .call_packed(&[unsafe { view_of(&value) }])
-            .and_then(i64::try_from)
-    })();
-    let Ok(expected) = expected else {
-        return false;
-    };
-    let map = unsafe { &*(value.data_union.v_obj as *const MapPrefix) };
-    expected >= 0 && map.size == expected as u64
-}
-
 /// Layout prefix shared by the C++ `ArrayObj` and `ListObj`.
 #[repr(C)]
 struct SeqPrefix {
@@ -1499,28 +1292,11 @@ const _: () = {
     assert!(std::mem::offset_of!(SeqPrefix, size) == 32);
 };
 
-#[derive(Clone, Copy)]
-struct TypeAttrColumn(NonNull<TVMFFITypeAttrColumn>);
-
-impl TypeAttrColumn {
-    /// Copy one borrowed cell; ownership remains with the registry.
-    fn get(self, type_index: i32) -> Option<TVMFFIAny> {
-        unsafe {
-            let column = self.0.as_ref();
-            let index = type_index - column.begin_index;
-            if index < 0 || index >= column.size || column.data.is_null() {
-                None
-            } else {
-                Some(*column.data.offset(index as isize))
-            }
-        }
-    }
-}
-
-fn type_attr_column(attr_name: &str) -> Option<TypeAttrColumn> {
+fn type_attr_column(attr_name: &str) -> Option<*const TVMFFITypeAttrColumn> {
     unsafe {
         let attr_name = TVMFFIByteArray::from_str(attr_name);
-        NonNull::new(TVMFFIGetTypeAttrColumn(&attr_name).cast_mut()).map(TypeAttrColumn)
+        let column = TVMFFIGetTypeAttrColumn(&attr_name);
+        (!column.is_null()).then_some(column)
     }
 }
 
@@ -1532,50 +1308,18 @@ fn type_attr_column(attr_name: &str) -> Option<TypeAttrColumn> {
 static STRUCTURAL_VISIT_COLUMN: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
-fn structural_visit_column() -> Option<TypeAttrColumn> {
+fn structural_visit_column() -> Option<*const TVMFFITypeAttrColumn> {
     let cached = STRUCTURAL_VISIT_COLUMN.load(Ordering::Relaxed);
     if cached != 0 {
-        let pointer = cached as *mut TVMFFITypeAttrColumn;
-        return Some(TypeAttrColumn(unsafe { NonNull::new_unchecked(pointer) }));
+        return Some(cached as *const TVMFFITypeAttrColumn);
     }
     let column = type_attr_column(STRUCTURAL_VISIT_ATTR)?;
-    STRUCTURAL_VISIT_COLUMN.store(column.0.as_ptr() as usize, Ordering::Relaxed);
+    STRUCTURAL_VISIT_COLUMN.store(column as usize, Ordering::Relaxed);
     Some(column)
 }
 
 fn type_key_of(type_index: i32) -> String {
-    unsafe {
-        let info = TVMFFIGetTypeInfo(type_index);
-        if info.is_null() {
-            format!("<type_index {type_index}>")
-        } else {
-            (*info).type_key.as_str().to_string()
-        }
-    }
-}
-
-/// Subtype check with the base's inheritance depth supplied by the caller
-/// (`ObjectCore::TYPE_DEPTH`), so only the object's type info is fetched.
-#[inline]
-fn is_instance_at_depth(object_type_index: i32, base_type_index: i32, base_depth: i32) -> bool {
-    if object_type_index == base_type_index {
-        return true;
-    }
-    unsafe {
-        let info = TVMFFIGetTypeInfo(object_type_index);
-        if info.is_null() {
-            return false;
-        }
-        if (*info).type_depth <= base_depth {
-            return false;
-        }
-        let ancestors = (*info).type_acenstors;
-        if ancestors.is_null() {
-            return false;
-        }
-        let ancestor = *ancestors.offset(base_depth as isize);
-        !ancestor.is_null() && (*ancestor).type_index == base_type_index
-    }
+    type_key_or_index(type_index)
 }
 
 /// Visit every reflected field of `type_index` and its ancestors in the same
@@ -1583,43 +1327,34 @@ fn is_instance_at_depth(object_type_index: i32, base_type_index: i32, base_depth
 ///
 /// # Safety
 ///
-/// `type_index` must be a registered type index.
+/// `info` must be a checked process-lifetime registry entry.
 unsafe fn for_each_field<B>(
-    type_index: i32,
-    mut callback: impl FnMut(&'static TVMFFIFieldInfo) -> ControlFlow<B>,
-) -> Option<B> {
-    let info = TVMFFIGetTypeInfo(type_index);
-    if info.is_null() {
-        return None;
-    }
+    info: &'static TVMFFITypeInfo,
+    mut callback: impl FnMut(&'static TVMFFITypeInfo, &'static TVMFFIFieldInfo) -> ControlFlow<B>,
+) -> Result<Option<B>> {
+    let ancestors = checked_type_ancestors(info)?;
 
     // Ancestor slot 0 is the root Object. C++ starts at slot 1, walks toward
     // the immediate parent, then visits the concrete type's own fields.
-    for depth in 1..(*info).type_depth {
-        let ancestor = *(*info).type_acenstors.offset(depth as isize);
-        if let Some(value) = visit_field_level(ancestor, &mut callback) {
-            return Some(value);
+    for &ancestor in ancestors.iter().skip(1) {
+        let ancestor = &*ancestor;
+        if let Some(value) = visit_field_level(ancestor, &mut callback)? {
+            return Ok(Some(value));
         }
     }
     visit_field_level(info, &mut callback)
 }
 
 unsafe fn visit_field_level<B>(
-    info: *const crate::tvm_ffi_sys::TVMFFITypeInfo,
-    callback: &mut impl FnMut(&'static TVMFFIFieldInfo) -> ControlFlow<B>,
-) -> Option<B> {
-    if info.is_null() || (*info).fields.is_null() {
-        return None;
-    }
-    let fields = std::slice::from_raw_parts((*info).fields, (*info).num_fields as usize);
-    for field in fields {
-        // C reflection tables are immortal once registered.
-        let field: &'static TVMFFIFieldInfo = &*(field as *const TVMFFIFieldInfo);
-        if let ControlFlow::Break(value) = callback(field) {
-            return Some(value);
+    info: &'static TVMFFITypeInfo,
+    callback: &mut impl FnMut(&'static TVMFFITypeInfo, &'static TVMFFIFieldInfo) -> ControlFlow<B>,
+) -> Result<Option<B>> {
+    for field in checked_type_fields(info)? {
+        if let ControlFlow::Break(value) = callback(info, field) {
+            return Ok(Some(value));
         }
     }
-    None
+    Ok(None)
 }
 
 #[inline]
@@ -1668,12 +1403,6 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn clone_any_field(field: *mut c_void, result: *mut TVMFFIAny) -> i32 {
-        let value = &*(field as *const Any);
-        *result = Any::into_raw_ffi_any(value.clone());
-        0
-    }
-
     #[test]
     fn def_region_is_inherited_through_containers() {
         let root = Array::new(vec![1i64, 2]);
@@ -1688,14 +1417,11 @@ mod tests {
     }
 
     #[test]
-    fn reflected_field_def_region_reaches_typed_handler() {
+    fn field_def_region_reaches_typed_handler() {
         let mut probe = TypedRegionProbe::default();
         let mut dispatch = (&mut probe).into_walker(WalkOrder::PreOrder);
-        let mut value = Any::from(7i64);
+        let value = Any::from(7i64);
         let mut field: TVMFFIFieldInfo = unsafe { std::mem::zeroed() };
-        field.name = unsafe { TVMFFIByteArray::from_str("value") };
-        field.getter = Some(clone_any_field);
-        let object = (&mut value as *mut Any).cast::<u8>();
 
         let mut children = WalkChildren {
             visitor: &mut dispatch,
@@ -1708,10 +1434,10 @@ mod tests {
             FLAG_SEQ_HASH_IGNORE,
         ] {
             field.flags = flags;
-            assert!(unsafe {
-                visit_reflected_field(object, &field, &mut children, DefRegionKind::None)
+            if flags & FLAG_SEQ_HASH_IGNORE == 0 {
+                let region = field_def_region(&field, DefRegionKind::None);
+                assert!(children.visit_child(raw_of_owned(&value), region).is_ok());
             }
-            .is_ok());
         }
         assert_eq!(
             probe.seen,

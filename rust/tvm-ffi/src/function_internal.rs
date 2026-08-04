@@ -17,7 +17,7 @@
  * under the License.
  */
 use crate::any::{Any, AnyView, ArgTryFromAnyView};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::string::{Bytes, String};
 use crate::type_traits::AnyCompatible;
 
@@ -35,6 +35,110 @@ where
     Fun: AsPackedCallable<I, O>,
 {
     func.call_packed(packed_args)
+}
+
+/// Validate and execute one Rust implementation of the packed C ABI.
+///
+/// # Safety
+///
+/// A non-null `args` must point to `num_args` initialized `TVMFFIAny` values,
+/// and a non-null `result` must point to writable `TVMFFIAny` storage.
+#[doc(hidden)]
+pub unsafe fn invoke_packed_c_abi<F>(
+    args: *const tvm_ffi_sys::TVMFFIAny,
+    num_args: i32,
+    result: *mut tvm_ffi_sys::TVMFFIAny,
+    callback: F,
+) -> i32
+where
+    F: FnOnce(&[AnyView]) -> Result<Any>,
+{
+    // Keep an outermost unwind barrier around validation, callback handling,
+    // error-object creation, result publication, and every destructor. The
+    // normal inner barrier below preserves the original panic message. This
+    // final barrier is for failures while reporting that panic (for example,
+    // TVMFFIErrorCreate failing and Error::new asserting); such a failure may
+    // leave no raised Error object, but it must never unwind across C.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        invoke_packed_c_abi_inner(args, num_args, result, callback)
+    })) {
+        Ok(status) => status,
+        Err(payload) => {
+            std::mem::forget(payload);
+            -1
+        }
+    }
+}
+
+unsafe fn invoke_packed_c_abi_inner<F>(
+    args: *const tvm_ffi_sys::TVMFFIAny,
+    num_args: i32,
+    result: *mut tvm_ffi_sys::TVMFFIAny,
+    callback: F,
+) -> i32
+where
+    F: FnOnce(&[AnyView]) -> Result<Any>,
+{
+    let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::ensure!(
+            !result.is_null(),
+            crate::error::VALUE_ERROR,
+            "callback result pointer is null"
+        );
+        let num_args = usize::try_from(num_args).map_err(|_| {
+            Error::new(
+                crate::error::VALUE_ERROR,
+                "callback argument count is negative",
+                "",
+            )
+        })?;
+        crate::ensure!(
+            num_args <= isize::MAX as usize / std::mem::size_of::<AnyView<'_>>(),
+            crate::error::VALUE_ERROR,
+            "callback argument span exceeds Rust slice limits"
+        );
+        let packed_args = if num_args == 0 {
+            &[]
+        } else {
+            crate::ensure!(
+                !args.is_null(),
+                crate::error::VALUE_ERROR,
+                "callback arguments are null"
+            );
+            std::slice::from_raw_parts(args.cast::<AnyView>(), num_args)
+        };
+        callback(packed_args)
+    }));
+    match returned {
+        Ok(Ok(value)) => {
+            std::ptr::write(result, Any::into_raw_ffi_any(value));
+            0
+        }
+        Ok(Err(error)) => {
+            Error::set_raised(&error);
+            -1
+        }
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_owned()
+            } else if let Some(message) = payload.downcast_ref::<std::string::String>() {
+                message.clone()
+            } else {
+                "Rust callback panicked".to_owned()
+            };
+            // A panic payload is arbitrary safe Rust and its destructor may
+            // itself panic. Keep that second unwind inside Rust as well; if it
+            // carries another panicking payload, leak only that exceptional
+            // payload rather than allowing unwind across the C ABI.
+            if let Err(nested_payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+            {
+                std::mem::forget(nested_payload);
+            }
+            Error::set_raised(&Error::new(crate::error::RUNTIME_ERROR, &message, ""));
+            -1
+        }
+    }
 }
 
 macro_rules! impl_as_packed_callable {

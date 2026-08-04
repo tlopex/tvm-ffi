@@ -54,11 +54,13 @@ pub use crate::extra::structural_visit::{
 };
 pub use crate::function::{get_kwargs_object, Function};
 pub use crate::object::ObjectRefCast;
-pub use crate::object::{Object, ObjectArc, ObjectCore, ObjectCoreWithExtraItems, ObjectRefCore};
+pub use crate::object::{
+    Object, ObjectArc, ObjectCore, ObjectCoreWithExtraItems, ObjectRefCore, RustAllocatableObject,
+};
 pub use crate::optional::Optional;
 pub use crate::string::{Bytes, String};
 pub use crate::type_traits::AnyCompatible;
-pub use crate::typed_expr::TypedExpr;
+pub use crate::typed_expr::{TypedExpr, TypedExprType};
 pub use tvm_ffi_macros::{dispatch, match_any};
 
 pub use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;

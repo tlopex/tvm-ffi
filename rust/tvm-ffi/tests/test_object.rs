@@ -22,13 +22,21 @@ use tvm_ffi::object::ObjectRef;
 use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex;
 use tvm_ffi::*;
 
+struct DropCounter(Arc<AtomicU32>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // must have repr(C) for the object header stays in the same position
 #[repr(C)]
 struct TestIntObj {
     object: Object,
     pub value: i64,
     // counter for recording the number of times the object is deleted
-    delete_counter: Arc<AtomicU32>,
+    delete_counter: DropCounter,
     pub extra_item_count: u64,
 }
 
@@ -37,15 +45,9 @@ impl TestIntObj {
         Self {
             object: Object::new(),
             value,
-            delete_counter,
+            delete_counter: DropCounter(delete_counter),
             extra_item_count,
         }
-    }
-}
-
-impl Drop for TestIntObj {
-    fn drop(&mut self) {
-        self.delete_counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -59,6 +61,12 @@ unsafe impl ObjectCore for TestIntObj {
     #[inline]
     unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
         Object::object_header_mut(&mut this.object)
+    }
+}
+
+unsafe impl RustAllocatableObject for TestIntObj {
+    unsafe fn drop_payload(this: *mut Self) {
+        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*this).delete_counter));
     }
 }
 
@@ -114,14 +122,61 @@ fn test_object_arc_with_extra_items() {
         let object = &mut *ObjectArc::as_raw_mut(&mut obj_arc);
         // layout check of extra items
         assert_eq!(TestIntObj::extra_items_count(object), 10);
-        assert_eq!(TestIntObj::extra_items(object).len(), 10);
-        assert_eq!(TestIntObj::extra_items_mut(object).len(), 10);
+        let expected =
+            (object as *mut TestIntObj as *mut u8).add(std::mem::size_of::<TestIntObj>());
+        let extra_items = TestIntObj::extra_items_uninit_mut(object);
+        assert_eq!(extra_items.len(), 10);
+        assert_eq!(extra_items.as_mut_ptr() as *mut u8, expected);
+        for (index, slot) in extra_items.iter_mut().enumerate() {
+            slot.write(index as u64);
+        }
         assert_eq!(
-            TestIntObj::extra_items_mut(object).as_ptr() as *mut u8,
-            (object as *mut TestIntObj as *mut u8).add(std::mem::size_of::<TestIntObj>())
+            TestIntObj::extra_items(object),
+            (0_u64..10).collect::<Vec<_>>()
         );
     }
     drop(obj_arc);
+    assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_extra_item_allocation_survives_two_phase_weak_destruction() {
+    let delete_counter = Arc::new(AtomicU32::new(0));
+    let mut object =
+        ObjectArc::new_with_extra_items(TestIntObj::new(12, delete_counter.clone(), 2));
+    unsafe {
+        let allocation = &mut *ObjectArc::as_raw_mut(&mut object);
+        for (index, slot) in TestIntObj::extra_items_uninit_mut(allocation)
+            .iter_mut()
+            .enumerate()
+        {
+            slot.write(index as u64);
+        }
+
+        let weak = tvm_ffi_sys::TVMFFITestingWeakObjectCreate(
+            ObjectArc::as_raw(&object).cast_mut().cast(),
+        );
+        assert!(!weak.is_null());
+        assert_eq!(ObjectArc::strong_count(&object), 1);
+        assert_eq!(ObjectArc::weak_count(&object), 2);
+
+        drop(object);
+        assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(tvm_ffi_sys::TVMFFITestingWeakObjectExpired(weak), 1);
+        assert_eq!(tvm_ffi_sys::TVMFFITestingWeakObjectLock(weak), 0);
+        tvm_ffi_sys::TVMFFITestingWeakObjectDelete(weak);
+        assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn test_extra_item_layout_overflow_is_rejected_before_allocation() {
+    let delete_counter = Arc::new(AtomicU32::new(0));
+    let data = TestIntObj::new(12, delete_counter.clone(), usize::MAX as u64);
+
+    let result = std::panic::catch_unwind(|| ObjectArc::new_with_extra_items(data));
+
+    assert!(result.is_err());
     assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
 }
 
@@ -184,4 +239,34 @@ fn test_object_arc_nullable_representation() {
     assert!(defined_ref.same_as(&defined_ref.clone()));
     let other_ref = <ObjectRef as ObjectRefCore>::from_data(ObjectArc::new(Object::new()));
     assert!(!defined_ref.same_as(&other_ref));
+}
+
+#[test]
+fn test_object_arc_clone_rejects_strong_count_overflow_without_corrupting_weak_count() {
+    let delete_counter = Arc::new(AtomicU32::new(0));
+    let object = ObjectArc::new(TestIntObj::new(11, delete_counter.clone(), 0));
+    let header = unsafe { ObjectArc::as_raw(&object) }
+        .cast_mut()
+        .cast::<TVMFFIObject>();
+    unsafe {
+        (*header)
+            .combined_ref_count
+            .store(u32::MAX as u64 | (1_u64 << 32), Ordering::Relaxed);
+    }
+
+    let result = std::panic::catch_unwind(|| object.clone());
+
+    assert!(result.is_err());
+    assert_eq!(
+        unsafe { (*header).combined_ref_count.load(Ordering::Relaxed) },
+        u32::MAX as u64 | (1_u64 << 32)
+    );
+    // Restore the real ownership count so dropping the sole handle remains valid.
+    unsafe {
+        (*header)
+            .combined_ref_count
+            .store(1 | (1_u64 << 32), Ordering::Relaxed);
+    }
+    drop(object);
+    assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
 }

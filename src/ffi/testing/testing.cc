@@ -169,6 +169,86 @@ class TestObjectDerived : public TestObjectBase {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestObjectDerived", TestObjectDerived, TestObjectBase);
 };
 
+// Minimal reflected expression fixture for Rust TypedExpr tests.  The object
+// is deliberately created in C++ so the reflection getter reads the canonical
+// C++ layout rather than a Rust test struct that merely shares its type key.
+class TestTypedExpr : public Object {
+ public:
+  explicit TestTypedExpr(Arc<TestObjectBase> result_type) : result_type(std::move(result_type)) {}
+
+  Arc<TestObjectBase> result_type;
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestTypedExpr", TestTypedExpr, Object);
+};
+
+// Dedicated on-demand corruption fixture for foreign-binding validation. The
+// registry entry is valid during normal test-library use (including stub
+// generation); `testing.make_malformed_reflection_object` corrupts it only in
+// the calling test process and restores the canonical entry before each case.
+class TestMalformedReflectionObj : public Object {
+ public:
+  int64_t value{7};
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestMalformedReflection", TestMalformedReflectionObj,
+                                    Object);
+};
+
+ObjectRef MakeMalformedReflectionObject(int64_t corruption) {
+  TVMFFITypeInfo* info = const_cast<TVMFFITypeInfo*>(
+      TVMFFIGetTypeInfo(TestMalformedReflectionObj::RuntimeTypeIndex()));
+  TVM_FFI_ICHECK_NOTNULL(info);
+
+  struct CanonicalMetadata {
+    int32_t type_depth;
+    const TVMFFITypeInfo** type_ancestors;
+    int32_t num_fields;
+    const TVMFFIFieldInfo* fields;
+    const TVMFFITypeMetadata* metadata;
+    TVMFFIFieldInfo field;
+  };
+  static const CanonicalMetadata canonical = [info]() {
+    TVM_FFI_ICHECK_EQ(info->num_fields, 1);
+    TVM_FFI_ICHECK_NOTNULL(info->fields);
+    return CanonicalMetadata{info->type_depth, info->type_ancestors, info->num_fields,
+                             info->fields,     info->metadata,       info->fields[0]};
+  }();
+
+  info->type_depth = canonical.type_depth;
+  info->type_ancestors = canonical.type_ancestors;
+  info->num_fields = canonical.num_fields;
+  info->fields = canonical.fields;
+  info->metadata = canonical.metadata;
+  *const_cast<TVMFFIFieldInfo*>(info->fields) = canonical.field;
+
+  TVMFFIFieldInfo* field = const_cast<TVMFFIFieldInfo*>(info->fields);
+  switch (corruption) {
+    case 0:
+      break;
+    case 1:
+      field->offset = -1;
+      break;
+    case 2:
+      TVM_FFI_ICHECK_NOTNULL(info->metadata);
+      field->offset = info->metadata->total_size;
+      break;
+    case 3:
+      field->alignment = 3;
+      break;
+    case 4:
+      info->num_fields = -1;
+      break;
+    case 5:
+      info->type_ancestors = nullptr;
+      break;
+    case 6:
+      info->metadata = nullptr;
+      break;
+    default:
+      TVM_FFI_THROW(ValueError) << "Unknown reflection corruption case " << corruption;
+  }
+  return ObjectRef(make_object<TestMalformedReflectionObj>());
+}
+
 class TestObjectPtrHolder : public Object {
  public:
   Arc<TestObjectBase> value;
@@ -482,6 +562,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def_rw("v_map", &TestObjectDerived::v_map)
       .def_rw("v_array", &TestObjectDerived::v_array);
 
+  refl::ObjectDef<TestTypedExpr>().def_ro("result_type", &TestTypedExpr::result_type);
+
+  refl::ObjectDef<TestMalformedReflectionObj>().def_ro("value", &TestMalformedReflectionObj::value);
+
   refl::ObjectDef<TestObjectPtrHolder>()
       .def_rw("value", &TestObjectPtrHolder::value)
       .def_rw("optional_value", &TestObjectPtrHolder::optional_value, refl::default_value(nullptr));
@@ -621,6 +705,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              std::cout << "Function finished without catching signal" << std::endl;
            })
       .def("testing.object_use_count", [](const Object* obj) { return obj->use_count(); })
+      .def("testing.make_typed_expr",
+           []() { return ObjectRef(make_object<TestTypedExpr>(make_arc<TestObjectBase>())); })
+      .def("testing.make_malformed_reflection_object", MakeMalformedReflectionObject)
       .def("testing.make_unregistered_object",
            []() { return ObjectRef(make_object<TestUnregisteredObject>(41, 42)); })
       .def("testing.get_add_one_c_symbol",
@@ -645,7 +732,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       // NOLINTBEGIN(performance-unnecessary-value-param)
       .def("testing.make_array_with_tensor", [](Tensor t) -> Array<Any> { return {std::move(t)}; })
       .def("testing.make_array_with_mixed",
-           [](Tensor t, int64_t x) -> Array<Any> { return {std::move(t), x, String("hello")}; })
+           [](Tensor t, int64_t x) -> Array<Any> {
+             return {std::move(t), x, String("hello")};
+           })
       .def("testing.make_nested_array_with_tensor",
            [](const Tensor& t) -> Array<Any> {
              Array<Any> inner{t, 42};
@@ -1007,3 +1096,25 @@ result : int
     Sum of a and b)");
 
 extern "C" TVM_FFI_DLL_EXPORT int TVMFFITestingDummyTarget() { return 0; }
+
+extern "C" TVM_FFI_DLL_EXPORT void* TVMFFITestingWeakObjectCreate(TVMFFIObjectHandle handle) {
+  using namespace tvm::ffi;
+  ObjectPtr<Object> strong =
+      details::ObjectUnsafe::ObjectPtrFromUnowned<Object>(static_cast<TVMFFIObject*>(handle));
+  return new WeakObjectPtr<Object>(strong);
+}
+
+extern "C" TVM_FFI_DLL_EXPORT int TVMFFITestingWeakObjectExpired(void* handle) {
+  using Weak = tvm::ffi::WeakObjectPtr<tvm::ffi::Object>;
+  return static_cast<Weak*>(handle)->expired();
+}
+
+extern "C" TVM_FFI_DLL_EXPORT int TVMFFITestingWeakObjectLock(void* handle) {
+  using Weak = tvm::ffi::WeakObjectPtr<tvm::ffi::Object>;
+  return static_cast<bool>(static_cast<Weak*>(handle)->lock());
+}
+
+extern "C" TVM_FFI_DLL_EXPORT void TVMFFITestingWeakObjectDelete(void* handle) {
+  using Weak = tvm::ffi::WeakObjectPtr<tvm::ffi::Object>;
+  delete static_cast<Weak*>(handle);
+}

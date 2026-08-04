@@ -233,15 +233,19 @@ impl TVMFFIByteArray {
     pub fn new(data: *const u8, size: usize) -> Self {
         Self { data, size }
     }
-    /// Convert the TVMFFIByteArray to a str view
+    /// Borrow this raw byte array as UTF-8.
     ///
-    /// # Arguments
-    /// * `self` - The TVMFFIByteArray to convert.
+    /// # Safety
     ///
-    /// # Returns
-    /// * `&str` - The converted str view.
-    pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.data, self.size)) }
+    /// If `size` is nonzero, `data` must point to `size` readable bytes that
+    /// remain alive for the returned borrow, and those bytes must be valid UTF-8.
+    pub unsafe fn as_str(&self) -> &str {
+        let bytes = if self.size == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(self.data, self.size)
+        };
+        std::str::from_utf8_unchecked(bytes)
     }
     /// Unsafe function to create a TVMFFIByteArray from a string
     /// This function is unsafe as it does not check lifetime of the string
@@ -525,4 +529,8 @@ unsafe extern "C" {
     ) -> *const TVMFFIByteArray;
     pub fn TVMFFIGetTypeInfo(type_index: i32) -> *const TVMFFITypeInfo;
     pub fn TVMFFITestingDummyTarget() -> i32;
+    pub fn TVMFFITestingWeakObjectCreate(handle: TVMFFIObjectHandle) -> *mut c_void;
+    pub fn TVMFFITestingWeakObjectExpired(handle: *mut c_void) -> i32;
+    pub fn TVMFFITestingWeakObjectLock(handle: *mut c_void) -> i32;
+    pub fn TVMFFITestingWeakObjectDelete(handle: *mut c_void);
 }

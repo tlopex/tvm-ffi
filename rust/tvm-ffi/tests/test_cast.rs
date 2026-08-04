@@ -22,6 +22,14 @@ use tvm_ffi::derive::{Object, ObjectRef};
 use tvm_ffi::object::{is_instance_of, ObjectRef};
 use tvm_ffi::*;
 
+struct DropCounter(Arc<AtomicU32>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // The type keys below are registered by libtvm_ffi_testing with the hierarchy
 // Object <- testing.TestObjectBase <- testing.TestObjectDerived. The Rust-side
 // field layout does not need to match the C++ classes: the objects are created
@@ -36,12 +44,12 @@ struct TestBaseObj {
     base: Object,
     value: i64,
     // counter for recording the number of times the object is deleted
-    delete_counter: Arc<AtomicU32>,
+    delete_counter: DropCounter,
 }
 
-impl Drop for TestBaseObj {
-    fn drop(&mut self) {
-        self.delete_counter.fetch_add(1, Ordering::Relaxed);
+unsafe impl RustAllocatableObject for TestBaseObj {
+    unsafe fn drop_payload(this: *mut Self) {
+        std::ptr::drop_in_place(std::ptr::addr_of_mut!((*this).delete_counter));
     }
 }
 
@@ -59,11 +67,60 @@ struct TestDerivedObj {
     extra: i64,
 }
 
+unsafe impl RustAllocatableObject for TestDerivedObj {
+    unsafe fn drop_payload(this: *mut Self) {
+        TestBaseObj::drop_payload(std::ptr::addr_of_mut!((*this).base));
+    }
+}
+
 #[repr(C)]
 #[derive(ObjectRef, Clone)]
 struct TestDerived {
     data: ObjectArc<TestDerivedObj>,
 }
+
+#[repr(C)]
+#[derive(Object)]
+#[type_key = "testing.TestTypedExpr"]
+struct TestExprObj {
+    base: Object,
+}
+
+#[repr(C)]
+#[derive(ObjectRef, Clone)]
+struct TestExpr {
+    data: ObjectArc<TestExprObj>,
+}
+
+#[repr(C)]
+#[derive(Object)]
+#[type_key = "testing.RustMissingCastTarget"]
+struct MissingTargetObj {
+    base: Object,
+}
+
+#[repr(C)]
+#[derive(ObjectRef, Clone)]
+struct MissingTarget {
+    data: ObjectArc<MissingTargetObj>,
+}
+
+macro_rules! impl_test_expr_type {
+    ($expected:ty) => {
+        impl TypedExprType<TestExpr> for $expected {
+            fn type_of(base: &TestExpr) -> Result<Self> {
+                tvm_ffi::object::get_object_field::<Self, _>(
+                    base,
+                    TestExprObj::type_index(),
+                    "result_type",
+                )
+            }
+        }
+    };
+}
+
+impl_test_expr_type!(TestBase);
+impl_test_expr_type!(TestDerived);
 
 // unwrap_err() requires the Ok type to implement Debug, which ObjectRef types do not
 fn expect_err<T>(res: Result<T>) -> Error {
@@ -78,7 +135,7 @@ fn new_base(value: i64, delete_counter: Arc<AtomicU32>) -> TestBase {
         data: ObjectArc::new(TestBaseObj {
             base: Object::new(),
             value,
-            delete_counter,
+            delete_counter: DropCounter(delete_counter),
         }),
     }
 }
@@ -89,7 +146,7 @@ fn new_derived(value: i64, extra: i64, delete_counter: Arc<AtomicU32>) -> TestDe
             base: TestBaseObj {
                 base: Object::new(),
                 value,
-                delete_counter,
+                delete_counter: DropCounter(delete_counter),
             },
             extra,
         }),
@@ -118,6 +175,25 @@ fn test_is_instance_of() {
     assert!(!is_instance_of::<TestBaseObj>(object_index));
     // non-object type indices never match an object type
     assert!(!is_instance_of::<Object>(TypeIndex::kTVMFFIInt as i32));
+}
+
+#[test]
+fn test_object_ref_reports_dynamic_type_index_and_null() {
+    let delete_counter = Arc::new(AtomicU32::new(0));
+    let base: TestBase = new_derived(1, 2, delete_counter.clone())
+        .try_cast()
+        .unwrap();
+    assert_eq!(
+        base.runtime_type_index(),
+        Some(TestDerivedObj::type_index())
+    );
+    drop(base);
+    assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
+
+    let null = <TestBase as ObjectRefCore>::from_data(unsafe {
+        ObjectArc::<TestBaseObj>::from_raw(std::ptr::null())
+    });
+    assert_eq!(null.runtime_type_index(), None);
 }
 
 #[test]
@@ -150,17 +226,32 @@ fn test_cast_checks_parameterized_container_type() {
 }
 
 #[test]
-fn test_typed_expr_conversion_checks_reflected_result_type() {
-    let delete_counter = Arc::new(AtomicU32::new(0));
-    let base = new_base(1, delete_counter.clone());
+fn test_typed_expr_validates_reflected_type_across_conversion_paths() {
+    assert_eq!(unsafe { tvm_ffi_sys::TVMFFITestingDummyTarget() }, 0);
+    let expr: TestExpr = Function::get_global("testing.make_typed_expr")
+        .unwrap()
+        .call_packed(&[])
+        .unwrap()
+        .try_into()
+        .unwrap();
 
-    // TestBase has no reflected `ty`; neither direct nor Any conversion may
-    // manufacture a refinement solely from the base object's type index.
-    assert!(TypedExpr::<TestBase, i64>::try_from_base(base.clone()).is_err());
-    assert!(TypedExpr::<TestBase, i64>::try_from(AnyView::from(&base)).is_err());
-    assert!(TypedExpr::<TestBase, i64>::try_from(Any::from(base.clone())).is_err());
-    drop(base);
-    assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
+    let direct = TypedExpr::<TestExpr, TestBase>::try_from_base(expr.clone()).unwrap();
+    assert!(direct.as_base().same_as(&expr));
+    assert!(direct.ty().unwrap().is_defined());
+
+    let from_view = TypedExpr::<TestExpr, TestBase>::try_from(AnyView::from(&expr)).unwrap();
+    assert!(from_view.as_base().same_as(&expr));
+
+    let from_any = TypedExpr::<TestExpr, TestBase>::try_from(Any::from(expr.clone())).unwrap();
+    assert!(from_any.as_base().same_as(&expr));
+
+    let from_cast: TypedExpr<TestExpr, TestBase> = expr.downcast().unwrap();
+    assert!(from_cast.as_base().same_as(&expr));
+
+    assert!(TypedExpr::<TestExpr, TestDerived>::try_from_base(expr.clone()).is_err());
+    assert!(TypedExpr::<TestExpr, TestDerived>::try_from(AnyView::from(&expr)).is_err());
+    assert!(TypedExpr::<TestExpr, TestDerived>::try_from(Any::from(expr.clone())).is_err());
+    assert!(expr.downcast::<TypedExpr<TestExpr, TestDerived>>().is_err());
 }
 
 #[test]
@@ -171,6 +262,19 @@ fn test_downcast_failure() {
     assert!(err.message().contains("testing.TestObjectBase"));
     assert!(err.message().contains("testing.TestObjectDerived"));
     // try_cast consumes the value even when the cast fails
+    assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_missing_dynamic_cast_target_is_a_normal_error() {
+    let delete_counter = Arc::new(AtomicU32::new(0));
+    let base = new_base(1, delete_counter.clone());
+
+    assert!(MissingTargetObj::try_type_index().is_err());
+    let result = std::panic::catch_unwind(|| base.downcast::<MissingTarget>());
+    assert!(result.is_ok(), "missing target type must not panic");
+    assert!(result.unwrap().is_err());
+    drop(base);
     assert_eq!(delete_counter.load(Ordering::Relaxed), 1);
 }
 

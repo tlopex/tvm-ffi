@@ -28,7 +28,7 @@ fn test_tensor_basic() {
     let shape = [2, 3, 4];
     let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
     let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
-    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, &shape, dtype, device);
+    let tensor = Tensor::from_nd_alloc(CPUNDAlloc::default(), &shape, dtype, device);
 
     // Test accessor methods
     assert_eq!(tensor.shape(), &shape);
@@ -52,14 +52,15 @@ fn test_tensor_data_as_slice_f32() {
     let shape = [2, 3, 4];
     let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
     let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
-    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, &shape, dtype, device);
+    let mut tensor = Tensor::from_nd_alloc(CPUNDAlloc::default(), &shape, dtype, device);
 
     // Test data_as_slice for f32
-    let data_slice = tensor.data_as_slice::<f32>().unwrap();
+    let data_slice = unsafe { tensor.data_as_slice_unchecked::<f32>() }.unwrap();
     assert_eq!(data_slice.len(), 24); // 2 * 3 * 4 = 24 elements
 
     // Test data_as_slice_mut for f32
-    let data_slice_mut = tensor.data_as_slice_mut::<f32>().unwrap();
+    // This CPUNDAlloc buffer has no other owner or view in this test.
+    let data_slice_mut = unsafe { tensor.data_as_slice_mut_unchecked::<f32>() }.unwrap();
     assert_eq!(data_slice_mut.len(), 24);
 
     // Test that we can write to the tensor data
@@ -68,7 +69,7 @@ fn test_tensor_data_as_slice_f32() {
     }
 
     // Test that we can read the written data
-    let data_slice_read = tensor.data_as_slice::<f32>().unwrap();
+    let data_slice_read = unsafe { tensor.data_as_slice_unchecked::<f32>() }.unwrap();
     for i in 0..data_slice_read.len() {
         assert_eq!(data_slice_read[i], i as f32);
     }
@@ -80,15 +81,28 @@ fn test_tensor_data_as_slice_type_mismatch() {
     let shape = [2, 3];
     let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
     let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
-    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, &shape, dtype, device);
+    let tensor = Tensor::from_nd_alloc(CPUNDAlloc::default(), &shape, dtype, device);
 
     // Test that trying to access as f64 (wrong type) fails
-    let result = tensor.data_as_slice::<f64>();
+    let result = unsafe { tensor.data_as_slice_unchecked::<f64>() };
     assert!(result.is_err());
 
     // Test that trying to access as i32 (wrong type) fails
-    let result = tensor.data_as_slice::<i32>();
+    let result = unsafe { tensor.data_as_slice_unchecked::<i32>() };
     assert!(result.is_err());
+}
+
+#[test]
+fn test_zero_element_tensor_uses_safe_empty_slices() {
+    let mut tensor = Tensor::from_slice::<f32>(&[], &[0]).unwrap();
+    assert_eq!(tensor.numel(), 0);
+    assert!(unsafe { tensor.data_as_slice_unchecked::<f32>() }
+        .unwrap()
+        .is_empty());
+    // Zero-length slices do not dereference the dangling allocation pointer.
+    assert!(unsafe { tensor.data_as_slice_mut_unchecked::<f32>() }
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -96,7 +110,7 @@ fn test_any_tensor() {
     let shape = [2, 3, 4];
     let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
     let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
-    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, &shape, dtype, device);
+    let tensor = Tensor::from_nd_alloc(CPUNDAlloc::default(), &shape, dtype, device);
     let any = Any::from(tensor.clone());
     let any_view = AnyView::from(&tensor);
 

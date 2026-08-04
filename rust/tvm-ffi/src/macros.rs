@@ -301,19 +301,12 @@ macro_rules! tvm_ffi_dll_export_typed_func {
                 num_args: i32,
                 result: *mut $crate::tvm_ffi_sys::TVMFFIAny,
             ) -> i32 {
-                let packed_args =
-                    std::slice::from_raw_parts(args as *const $crate::any::AnyView, num_args as usize);
-                let ret_value = $crate::function_internal::call_packed_callable($func, packed_args);
-                match ret_value {
-                    Ok(value) => {
-                        *result = $crate::any::Any::into_raw_ffi_any(value);
-                        0
-                    }
-                    Err(error) => {
-                        $crate::error::Error::set_raised(&error);
-                        -1
-                    }
-                }
+                $crate::function_internal::invoke_packed_c_abi(
+                    args,
+                    num_args,
+                    result,
+                    |packed_args| $crate::function_internal::call_packed_callable($func, packed_args),
+                )
             }
         }
     };

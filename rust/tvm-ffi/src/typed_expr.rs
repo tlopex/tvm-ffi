@@ -23,10 +23,24 @@ use tvm_ffi_sys::TVMFFIAny;
 
 use crate::any::{Any, AnyView, TryFromTemp};
 use crate::error::Result;
-use crate::object::{get_object_field, ObjectCore, ObjectRefCore};
+use crate::object::ObjectRefCore;
 use crate::type_traits::AnyCompatible;
 
-/// An object reference whose reflected `ty` field has type `Expected`.
+/// Domain policy used to validate a [`TypedExpr`] refinement.
+///
+/// Reflection schemas identify the base and expected types, but do not encode
+/// how a particular IR obtains its result type.  The crate defining `Base`
+/// must provide that semantic bridge instead of making this generic runtime
+/// assume a field name or object layout.
+pub trait TypedExprType<Base>: ObjectRefCore + AnyCompatible
+where
+    Base: ObjectRefCore,
+{
+    /// Return the checked result type for `base`.
+    fn type_of(base: &Base) -> Result<Self>;
+}
+
+/// An object reference whose domain-defined result type is `Expected`.
 ///
 /// `Base` preserves the expression's runtime object type. `Expected` is a
 /// refinement checked through reflection whenever an unrefined value enters
@@ -68,24 +82,26 @@ impl<Base, Expected> TypedExpr<Base, Expected> {
 impl<Base, Expected> TypedExpr<Base, Expected>
 where
     Base: ObjectRefCore,
-    Expected: AnyCompatible,
+    Expected: TypedExprType<Base>,
 {
-    fn reflected_ty(base: &Base) -> Result<Expected> {
-        get_object_field::<Expected, _>(
-            base,
-            <Base::ContainerType as ObjectCore>::type_index(),
-            "ty",
-        )
+    /// Return whether two refinements point to the same underlying object.
+    #[inline]
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.base.same_as(&other.base)
+    }
+
+    fn checked_type(base: &Base) -> Result<Expected> {
+        Expected::type_of(base)
     }
 
     /// Return the expression's result type with the refinement preserved.
     pub fn ty(&self) -> Result<Expected> {
-        Self::reflected_ty(&self.base)
+        Self::checked_type(&self.base)
     }
 
-    /// Check `base`'s reflected result type and add the refinement.
+    /// Check `base`'s domain-defined result type and add the refinement.
     pub fn try_from_base(base: Base) -> Result<Self> {
-        Self::reflected_ty(&base)?;
+        Self::checked_type(&base)?;
         Ok(Self::from_validated_base(base))
     }
 }
@@ -98,31 +114,10 @@ impl<Base, Expected> Deref for TypedExpr<Base, Expected> {
     }
 }
 
-unsafe impl<Base, Expected> ObjectRefCore for TypedExpr<Base, Expected>
-where
-    Base: ObjectRefCore,
-    Expected: AnyCompatible,
-{
-    type ContainerType = Base::ContainerType;
-
-    fn data(this: &Self) -> &crate::ObjectArc<Self::ContainerType> {
-        Base::data(&this.base)
-    }
-
-    fn into_data(this: Self) -> crate::ObjectArc<Self::ContainerType> {
-        Base::into_data(this.base)
-    }
-
-    fn from_data(data: crate::ObjectArc<Self::ContainerType>) -> Self {
-        Self::try_from_base(Base::from_data(data))
-            .unwrap_or_else(|error| panic!("invalid TypedExpr object reference: {error}"))
-    }
-}
-
 unsafe impl<Base, Expected> AnyCompatible for TypedExpr<Base, Expected>
 where
     Base: ObjectRefCore + AnyCompatible,
-    Expected: AnyCompatible,
+    Expected: TypedExprType<Base>,
 {
     const MATCH_ANY_EXACT: bool = false;
 
@@ -139,7 +134,7 @@ where
             return false;
         }
         let base = Base::copy_from_any_view_after_check(data);
-        Self::reflected_ty(&base).is_ok()
+        Self::checked_type(&base).is_ok()
     }
 
     unsafe fn copy_from_any_view_after_check(data: &TVMFFIAny) -> Self {
@@ -151,13 +146,16 @@ where
     }
 
     unsafe fn try_cast_from_any_view(data: &TVMFFIAny) -> std::result::Result<Self, ()> {
-        let base = Base::try_cast_from_any_view(data)?;
+        if !Base::check_any_strict(data) {
+            return Err(());
+        }
+        let base = Base::copy_from_any_view_after_check(data);
         Self::try_from_base(base).map_err(|_| ())
     }
 
     fn get_mismatch_type_info(data: &TVMFFIAny) -> String {
         format!(
-            "{} with incompatible `ty`",
+            "{} with incompatible TypedExpr constraint",
             Base::get_mismatch_type_info(data)
         )
     }
@@ -170,7 +168,7 @@ where
 impl<Base, Expected> TryFrom<Any> for TypedExpr<Base, Expected>
 where
     Base: ObjectRefCore + AnyCompatible,
-    Expected: AnyCompatible,
+    Expected: TypedExprType<Base>,
 {
     type Error = crate::Error;
 
@@ -182,11 +180,34 @@ where
 impl<'a, Base, Expected> TryFrom<AnyView<'a>> for TypedExpr<Base, Expected>
 where
     Base: ObjectRefCore + AnyCompatible,
-    Expected: AnyCompatible,
+    Expected: TypedExprType<Base>,
 {
     type Error = crate::Error;
 
     fn try_from(value: AnyView<'a>) -> Result<Self> {
         TryFromTemp::<Self>::try_from(value).map(TryFromTemp::into_value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TypedExpr, TypedExprType};
+    use crate::{AnyView, Array, Result};
+
+    impl TypedExprType<Array<i64>> for Array<i64> {
+        fn type_of(base: &Array<i64>) -> Result<Self> {
+            Ok(base.clone())
+        }
+    }
+
+    #[test]
+    fn typed_expr_never_inherits_its_base_conversion_fallback() {
+        let bools = Array::new(vec![true, false]);
+        let view = AnyView::from(&bools);
+
+        // Array conversion deliberately supports element-wise bool -> i64.
+        assert!(Array::<i64>::try_from(view).is_ok());
+        // TypedExpr is a strict refinement of its exact Base representation.
+        assert!(TypedExpr::<Array<i64>, Array<i64>>::try_from(view).is_err());
     }
 }

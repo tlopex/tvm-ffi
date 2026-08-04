@@ -23,18 +23,16 @@ use tvm_ffi::*;
 fn create_tensor(val: f32, shape: &[i64]) -> Tensor {
     let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
     let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
-    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, shape, dtype, device);
-    if let Ok(slice) = tensor.data_as_slice_mut::<f32>() {
-        slice[0] = val;
-    }
+    let mut tensor = Tensor::from_nd_alloc(CPUNDAlloc::default(), shape, dtype, device);
+    // The freshly allocated test Tensor has no other data owner or view.
+    unsafe { tensor.data_as_slice_mut_unchecked::<f32>() }.unwrap()[0] = val;
     tensor
 }
 
 /// Helper to read the first `f32` of a tensor.
 fn get_val(tensor: &Tensor) -> f32 {
-    tensor
-        .data_as_slice::<f32>()
-        .expect("Type mismatch or null")[0]
+    // Test fixtures do not expose their CPU buffers to another owner.
+    unsafe { tensor.data_as_slice_unchecked::<f32>() }.expect("Type mismatch or null")[0]
 }
 
 #[test]
@@ -149,6 +147,7 @@ fn test_map_shares_underlying_object() {
     let map: Map<i64, i64> = [(1i64, 10i64)].into_iter().collect();
     // Cloning shares the same underlying MapObj rather than copying entries.
     let clone = map.clone();
+    assert!(map.same_as(&clone));
     assert_eq!(clone.len(), 1);
     assert_eq!(clone.get(&1).unwrap(), Some(10));
 }

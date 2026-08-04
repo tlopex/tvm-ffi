@@ -36,7 +36,15 @@ fn main() {
     let x_data: &[f32] = &[0.0, 1.0, 2.0, 3.0];
     let x = Tensor::from_slice(x_data, &[4]).unwrap();
     let y = Tensor::from_slice(&[0.0f32; 4], &[4]).unwrap();
-    println!("x: {:?}", x.data_as_slice::<f32>().unwrap());
+    // No call may mutate `x` while this temporary slice is borrowed.
+    println!(
+        "x: {:?}",
+        unsafe { x.data_as_slice_unchecked::<f32>() }.unwrap()
+    );
     typed_add_one(&x, &y).unwrap();
-    println!("y: {:?}", y.data_as_slice::<f32>().unwrap());
+    // The kernel call has completed before this temporary borrow.
+    println!(
+        "y: {:?}",
+        unsafe { y.data_as_slice_unchecked::<f32>() }.unwrap()
+    );
 }
