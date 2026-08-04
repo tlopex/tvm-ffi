@@ -325,6 +325,7 @@ def test_rust_api_scaffold_has_license() -> None:
 
     assert source.startswith(RUST_LICENSE_HEADER)
     assert source.count("Licensed to the Apache Software Foundation") == 1
+    assert "#![allow(clippy::all, dead_code, unused_imports)]" in source
     assert f"{C.RUST_SYNTAX.begin} import-section" in source
     assert f"{C.RUST_SYNTAX.begin} global/test" in source
 
