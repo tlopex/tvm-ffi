@@ -136,6 +136,23 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType>;
     fn into_data(this: Self) -> ObjectArc<Self::ContainerType>;
     fn from_data(data: ObjectArc<Self::ContainerType>) -> Self;
+
+    /// Return whether this handle contains a C++ object.
+    ///
+    /// This is the Rust equivalent of C++ `ObjectRef::defined()`.  Generated
+    /// object fields such as `Span`, `Attrs`, and `IterVar::dom` may legally
+    /// contain a null object-reference slot even though their Rust field type
+    /// is not wrapped in [`Option`].
+    #[inline]
+    fn is_defined(&self) -> bool {
+        !ObjectArc::is_null(Self::data(self))
+    }
+
+    /// Return whether this handle is C++'s null `ObjectRef` representation.
+    #[inline]
+    fn is_null(&self) -> bool {
+        ObjectArc::is_null(Self::data(self))
+    }
 }
 
 /// Check whether a runtime type index refers to `Target` or one of its

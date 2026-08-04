@@ -161,7 +161,13 @@ fn test_object_arc_nullable_representation() {
     let null_ref = <ObjectRef as ObjectRefCore>::from_data(unsafe {
         ObjectArc::<Object>::from_raw(std::ptr::null())
     });
+    assert!(null_ref.is_null());
+    assert!(!null_ref.is_defined());
     let null_any = Any::from(null_ref.clone());
     assert_eq!(null_any.type_index(), TVMFFITypeIndex::kTVMFFINone as i32);
     assert!(AnyView::from(&null_ref).try_as::<ObjectRef>().is_none());
+
+    let defined_ref = <ObjectRef as ObjectRefCore>::from_data(ObjectArc::new(Object::new()));
+    assert!(!defined_ref.is_null());
+    assert!(defined_ref.is_defined());
 }
