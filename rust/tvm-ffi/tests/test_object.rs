@@ -144,6 +144,16 @@ fn test_object_arc_from_raw() {
 
 #[test]
 fn test_object_arc_nullable_representation() {
+    // The thread-safety marker on Object is zero-sized and must not change the
+    // C object-header prefix used by every Rust-owned object allocation.
+    assert_eq!(
+        std::mem::size_of::<Object>(),
+        std::mem::size_of::<TVMFFIObject>()
+    );
+    assert_eq!(
+        std::mem::align_of::<Object>(),
+        std::mem::align_of::<TVMFFIObject>()
+    );
     assert_eq!(
         std::mem::size_of::<ObjectArc<TestIntObj>>(),
         std::mem::size_of::<*const TestIntObj>()

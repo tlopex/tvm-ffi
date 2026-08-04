@@ -16,7 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use std::marker::PhantomData;
 use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
 use crate::any::{Any, TryFromTemp};
@@ -32,6 +34,9 @@ use tvm_ffi_sys::{TVMFFIAny, TVMFFIGetTypeInfo, TVMFFIObject, COMBINED_REF_COUNT
 pub struct Object {
     /// example implementation of the object
     header: TVMFFIObject,
+    // Type erasure must not manufacture thread safety for an arbitrary C++
+    // object. Concrete types may opt in only after their contract proves it.
+    _not_send_sync: PhantomData<Rc<()>>,
 }
 
 /// Arc-like wrapper for Object that allows shared ownership.
@@ -41,6 +46,13 @@ pub struct Object {
 /// panics before a Rust reference is formed.
 ///
 /// \tparam T The type of the object to be wrapped
+///
+/// A fully type-erased object remains thread-bound:
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<tvm_ffi::ObjectArc<tvm_ffi::Object>>();
+/// ```
 #[repr(C)]
 pub struct ObjectArc<T: ObjectCore> {
     // C++ ObjectRef uses a nullable pointer slot.  Top-level handles returned
@@ -378,9 +390,15 @@ pub trait ObjectRefCast: ObjectRefCore + AnyCompatible {
 
 impl<T: ObjectRefCore + AnyCompatible> ObjectRefCast for T {}
 
-/// Base class for ObjectRef
+/// Base class for ObjectRef.
 ///
-/// This class is used to store the data of the ObjectRef
+/// This class is used to store the data of the ObjectRef. Erasing a concrete
+/// object's type must not make it transferable to another thread:
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<tvm_ffi::object::ObjectRef>();
+/// ```
 #[repr(C)]
 #[derive(ObjectRef, Clone)]
 pub struct ObjectRef {
@@ -532,6 +550,7 @@ impl Object {
     pub fn new() -> Self {
         Self {
             header: TVMFFIObject::new(),
+            _not_send_sync: PhantomData,
         }
     }
 }

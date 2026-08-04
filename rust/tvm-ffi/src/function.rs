@@ -53,12 +53,12 @@ pub struct Function {
 /// can correctly delete the entire object including callback part
 /// then we will convert to ObjectArc<FunctionObj> to be used as function
 #[repr(C)]
-struct CallbackFunctionObjImpl<F: Fn(&[AnyView]) -> Result<Any> + 'static> {
+struct CallbackFunctionObjImpl<F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static> {
     function: FunctionObj,
     callback: F,
 }
 
-impl<F: Fn(&[AnyView]) -> Result<Any> + 'static> CallbackFunctionObjImpl<F> {
+impl<F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static> CallbackFunctionObjImpl<F> {
     pub fn from_callback(callback: F) -> Self {
         Self {
             function: FunctionObj {
@@ -95,7 +95,9 @@ impl<F: Fn(&[AnyView]) -> Result<Any> + 'static> CallbackFunctionObjImpl<F> {
     }
 }
 
-unsafe impl<F: Fn(&[AnyView]) -> Result<Any> + 'static> ObjectCore for CallbackFunctionObjImpl<F> {
+unsafe impl<F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static> ObjectCore
+    for CallbackFunctionObjImpl<F>
+{
     const TYPE_KEY: &'static str = FunctionObj::TYPE_KEY;
     const TYPE_DEPTH: i32 = FunctionObj::TYPE_DEPTH;
     fn type_index() -> i32 {
@@ -319,7 +321,21 @@ impl Function {
             Ok(())
         }
     }
-    /// Construct a function from a packed function
+    /// Construct a function from a packed function.
+    ///
+    /// Callbacks may be retained by the C++ registry and invoked from another
+    /// thread, so captured state must be both `Send` and `Sync`.
+    ///
+    /// ```compile_fail
+    /// use std::rc::Rc;
+    /// use tvm_ffi::{Any, Function, Result};
+    ///
+    /// let local = Rc::new(());
+    /// let _ = Function::from_packed(move |_| -> Result<Any> {
+    ///     let _ = local.clone();
+    ///     Ok(Any::new())
+    /// });
+    /// ```
     /// # Arguments
     /// * `func` - The packed function in signature of `Fn(&[AnyView]) -> Result<Any>`
     ///
@@ -327,7 +343,7 @@ impl Function {
     /// * `Function` - The function
     pub fn from_packed<F>(func: F) -> Self
     where
-        F: Fn(&[AnyView]) -> Result<Any> + 'static,
+        F: Fn(&[AnyView]) -> Result<Any> + Send + Sync + 'static,
     {
         unsafe {
             let callback_arc = ObjectArc::new(CallbackFunctionObjImpl::from_callback(func));
@@ -346,7 +362,7 @@ impl Function {
     /// * `Function` - The function
     pub fn from_typed<F, I, O>(func: F) -> Self
     where
-        F: AsPackedCallable<I, O> + 'static,
+        F: AsPackedCallable<I, O> + Send + Sync + 'static,
     {
         let closure = move |packed_args: &[AnyView]| -> Result<Any> {
             let ret_value = func.call_packed(packed_args)?;
