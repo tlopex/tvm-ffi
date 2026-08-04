@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 
 use crate::derive::ObjectRef;
@@ -586,18 +586,6 @@ impl<T: ObjectCore> Deref for ObjectArc<T> {
             "attempted to dereference a null TVM ObjectRef"
         );
         unsafe { &*self.ptr }
-    }
-}
-
-// implement DerefMut for ObjectArc
-impl<T: ObjectCore> DerefMut for ObjectArc<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        assert!(
-            !self.ptr.is_null(),
-            "attempted to mutably dereference a null TVM ObjectRef"
-        );
-        unsafe { &mut *self.ptr }
     }
 }
 

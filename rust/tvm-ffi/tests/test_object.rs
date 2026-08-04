@@ -111,13 +111,14 @@ fn test_object_arc_with_extra_items() {
     assert_eq!(ObjectArc::weak_count(&obj_arc), 1);
     assert_eq!(delete_counter.load(Ordering::Relaxed), 0);
     unsafe {
+        let object = &mut *ObjectArc::as_raw_mut(&mut obj_arc);
         // layout check of extra items
-        assert_eq!(TestIntObj::extra_items_count(&obj_arc), 10);
-        assert_eq!(TestIntObj::extra_items(&obj_arc).len(), 10);
-        assert_eq!(TestIntObj::extra_items_mut(&mut obj_arc).len(), 10);
+        assert_eq!(TestIntObj::extra_items_count(object), 10);
+        assert_eq!(TestIntObj::extra_items(object).len(), 10);
+        assert_eq!(TestIntObj::extra_items_mut(object).len(), 10);
         assert_eq!(
-            TestIntObj::extra_items_mut(&mut obj_arc).as_ptr() as *mut u8,
-            (ObjectArc::as_raw_mut(&mut obj_arc) as *mut u8).add(std::mem::size_of::<TestIntObj>())
+            TestIntObj::extra_items_mut(object).as_ptr() as *mut u8,
+            (object as *mut TestIntObj as *mut u8).add(std::mem::size_of::<TestIntObj>())
         );
     }
     drop(obj_arc);
