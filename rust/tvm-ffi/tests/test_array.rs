@@ -84,6 +84,7 @@ fn test_null_array_encodes_as_ffi_none() {
     let array = <Array<i64> as ObjectRefCore>::from_data(unsafe {
         ObjectArc::<ArrayObj>::from_raw(std::ptr::null())
     });
+    assert!(std::panic::catch_unwind(|| array.len()).is_err());
     assert_eq!(
         Any::from(array.clone()).type_index(),
         TypeIndex::kTVMFFINone as i32
