@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import consts as C
-from .file_utils import FileInfo, collect_files, syntax_for
+from .file_utils import (
+    FileInfo,
+    collect_files,
+    print_text_diff,
+    syntax_for,
+    write_text_atomic,
+)
 from .generator import get_generator
 from .lib_state import (
     collect_global_funcs,
@@ -35,6 +41,7 @@ from .lib_state import (
     object_info_from_type_key,
     toposort_objects,
 )
+from .rust_generator.utils import split_rust_module_prefix
 from .utils import FuncInfo, InitConfig, Options
 
 if TYPE_CHECKING:
@@ -52,13 +59,23 @@ def __main__() -> int:
     generator = get_generator(opt.target)
     dlls = _load_extensions(opt)
     files, init_path = _collect_inputs(opt)
-    exact_prefixes = {
+    marker_prefixes = {
         code.param[0]
         for file in files
         for code in file.code_blocks
         if code.kind == "global" and isinstance(code.param, tuple)
     }
-    recursive_prefixes = {opt.init.prefix.rstrip(".")} if opt.init is not None else set()
+    recursive_prefixes = set(opt.init.normalized_prefixes()) if opt.init is not None else set()
+    if opt.target == "rust":
+        for prefix in recursive_prefixes:
+            split_rust_module_prefix(prefix)
+    # Init-generated files contain global markers too. A marker already covered
+    # by a recursive root is redundant on an idempotent rerun.
+    exact_prefixes = {
+        prefix
+        for prefix in marker_prefixes
+        if not any(prefix == root or prefix.startswith(f"{root}.") for root in recursive_prefixes)
+    }
     global_funcs = collect_global_funcs(exact_prefixes, recursive_prefixes)
 
     # All generation happens against in-memory FileInfo objects. No file is
@@ -67,14 +84,20 @@ def __main__() -> int:
     generated_prefixes, scaffold_failed = _generate_scaffolds(
         files, opt, init_path, ty_map, global_funcs, generator
     )
-    render_failed = _render_files(files, opt, ty_map, global_funcs, generator)
+    render_failed = _render_files(files, opt, ty_map, global_funcs, generator, init_path)
     failed = collect_failed or scaffold_failed or render_failed
-    preflight_failed = _validate_init(not failed, opt, init_path, generated_prefixes, generator)
-    failed |= preflight_failed
-    committed = _commit_files(files, opt, failed)
-    failed |= _finalize_init(
-        committed and not preflight_failed, opt, init_path, generated_prefixes, generator
-    )
+    try:
+        _commit_files(
+            files,
+            opt,
+            failed,
+            init_path=init_path,
+            generated_prefixes=generated_prefixes,
+            generator=generator,
+        )
+    except Exception:
+        failed = True
+        print(f"{C.TERM_RED}[Failed] Commit: {traceback.format_exc()}{C.TERM_RESET}")
 
     # Keep preloaded libraries alive until every registry-backed stage finishes.
     del dlls
@@ -115,10 +138,11 @@ def _print_file_failure(file: FileInfo) -> None:
 def _collect_type_map(files: list[FileInfo], generator: Generator) -> tuple[dict[str, str], bool]:
     """Run stage 1 for every file, retaining independent successes."""
     ty_map = generator.default_ty_map()
+    definitions: dict[str, tuple[str, Path, int]] = {}
     failed = False
     for file in files:
         try:
-            _stage_1(file, ty_map)
+            _stage_1(file, ty_map, definitions)
         except Exception:
             failed = True
             _print_file_failure(file)
@@ -157,75 +181,152 @@ def _render_files(
     ty_map: dict[str, str],
     global_funcs: dict[str, list[FuncInfo]],
     generator: Generator,
+    init_path: Path | None = None,
 ) -> bool:
     """Run stage 3 for every file, retaining independent successes."""
     failed = False
+    type_locations: dict[str, Path] = {}
     for file in files:
-        if opt.verbose:
-            print(f"{C.TERM_CYAN}[File] {file.path}{C.TERM_RESET}")
+        for code in file.code_blocks:
+            if code.kind != "object" or not isinstance(code.param, str):
+                continue
+            location = file.path.resolve()
+            previous = type_locations.setdefault(code.param, location)
+            if previous != location:
+                print(
+                    f"{C.TERM_RED}[Failed] Object {code.param!r} is declared in both "
+                    f"{previous} and {location}{C.TERM_RESET}"
+                )
+                return True
+
+    known_type_keys = set(type_locations)
+    module_by_file: dict[Path, tuple[str, ...] | None] = {}
+    root = init_path.resolve() if init_path is not None else None
+    for file in files:
+        module_segments: tuple[str, ...] | None = None
+        if opt.target == "rust" and root is not None and file.path.name == "mod.rs":
+            try:
+                relative = file.path.resolve().relative_to(root)
+                module_segments = tuple(relative.parts[:-1])
+            except ValueError:
+                pass
+        module_by_file[file.path.resolve()] = module_segments
+
+    canonical_type_keys = {
+        type_key
+        for type_key, path in type_locations.items()
+        if module_by_file.get(path) == tuple(type_key.split(".")[:-1])
+    }
+    for file in files:
+        local_type_keys = {
+            code.param
+            for code in file.code_blocks
+            if code.kind == "object" and isinstance(code.param, str)
+        }
         try:
-            _stage_3(file, opt, ty_map, global_funcs, generator=generator)
+            _stage_3(
+                file,
+                opt,
+                ty_map,
+                global_funcs,
+                generator=generator,
+                known_type_keys=known_type_keys,
+                local_type_keys=local_type_keys,
+                canonical_type_keys=canonical_type_keys,
+                module_segments=module_by_file[file.path.resolve()],
+            )
         except Exception:
             failed = True
             _print_file_failure(file)
     return failed
 
 
-def _commit_files(files: list[FileInfo], opt: Options, failed: bool) -> bool:
-    """Atomically write generated files only after every stage succeeds."""
-    commit_outputs = not failed
-    if commit_outputs:
-        for file in files:
-            file.update(verbose=opt.verbose, dry_run=opt.dry_run)
-    elif opt.verbose:
-        # A failed dry run may still show the complete would-be diff.
-        for file in files:
-            file.update(verbose=True, dry_run=True)
-    return commit_outputs and not opt.dry_run
-
-
-def _validate_init(
-    would_commit: bool,
+def _plan_outputs(
+    files: list[FileInfo],
     opt: Options,
-    init_path: Path,
-    generated_prefixes: set[str],
-    generator: Generator,
-) -> bool:
-    """Preflight tree finalization so a failure precedes all writes."""
-    if not would_commit or opt.init is None or not generated_prefixes:
-        return False
-    try:
-        generator.validate_init(init_path, generated_prefixes)
-        return False
-    except Exception:
-        print(
-            f"{C.TERM_RED}[Failed] Finalization preflight: {traceback.format_exc()}{C.TERM_RESET}"
+    init_path: Path | None,
+    generated_prefixes: set[str] | None,
+    generator: Generator | None,
+) -> dict[Path, str]:
+    """Compose generated source and module-tree outputs without writing."""
+    outputs = {file.path.resolve(): file.rendered_text() for file in files}
+    prefixes = generated_prefixes or set()
+    if opt.init is not None and prefixes:
+        if init_path is None or generator is None:
+            raise ValueError("init generation requires an init path and language generator")
+        generated_items = {file.path.resolve(): file.generated_items for file in files}
+        module_outputs = generator.plan_init(
+            init_path,
+            prefixes,
+            outputs,
+            generated_items,
         )
-        return True
+        module_outputs = {path.resolve(): source for path, source in module_outputs.items()}
+        outputs.update(module_outputs)
+    return outputs
 
 
-def _finalize_init(
-    committed: bool,
+def _changed_outputs(
+    outputs: dict[Path, str],
+) -> dict[Path, str]:
+    """Filter a fully rendered plan to files whose bytes would change."""
+    return {
+        path: source
+        for path, source in outputs.items()
+        if not path.exists() or path.read_text(encoding="utf-8") != source
+    }
+
+
+def _preview_outputs(outputs: dict[Path, str]) -> None:
+    """Print final planned source and module-tree outputs."""
+    for path, source in sorted(outputs.items(), key=lambda item: str(item[0])):
+        before = tuple(path.read_text(encoding="utf-8").splitlines()) if path.exists() else ()
+        print_text_diff(path, before, tuple(source.splitlines()))
+
+
+def _commit_files(
+    files: list[FileInfo],
     opt: Options,
-    init_path: Path,
-    generated_prefixes: set[str],
-    generator: Generator,
+    failed: bool,
+    *,
+    init_path: Path | None = None,
+    generated_prefixes: set[str] | None = None,
+    generator: Generator | None = None,
 ) -> bool:
-    """Stitch a committed init tree and report whether finalization failed."""
-    if not committed or opt.init is None or not generated_prefixes:
+    """Plan every output, then replace each changed file atomically."""
+    if failed:
+        # A failed generation may still show its successfully rendered files,
+        # but no module-tree plan is valid and nothing is committed.
+        if opt.verbose or opt.dry_run:
+            for file in files:
+                print_text_diff(file.path, file.lines, file.rendered_lines())
         return False
-    try:
-        generator.finalize_init(init_path, generated_prefixes)
+
+    outputs = _plan_outputs(files, opt, init_path, generated_prefixes, generator)
+    changes = _changed_outputs(outputs)
+    if opt.verbose or opt.dry_run:
+        _preview_outputs(changes)
+    if opt.dry_run:
         return False
-    except Exception:
-        print(f"{C.TERM_RED}[Failed] Finalization: {traceback.format_exc()}{C.TERM_RESET}")
-        return True
+
+    for path, source in sorted(changes.items(), key=lambda item: str(item[0])):
+        write_text_atomic(path, source)
+    for file in files:
+        path = file.path.resolve()
+        if path in outputs:
+            file.lines = tuple(outputs[path].splitlines())
+    return True
 
 
 def _stage_1(
     file: FileInfo,
     ty_map: dict[str, str],
+    definitions: dict[str, tuple[str, Path, int]] | None = None,
 ) -> None:
+    """Parse one file's type maps atomically and reject ambiguous definitions."""
+    if definitions is None:
+        definitions = {}
+    pending: dict[str, tuple[str, Path, int]] = {}
     for code in file.code_blocks:
         if code.kind == "ty-map":
             try:
@@ -233,9 +334,31 @@ def _stage_1(
                 lhs, rhs = code.param.split("->")
             except ValueError as e:
                 raise ValueError(
-                    f"Invalid ty_map format at line {code.lineno_start}. Example: `A.B -> C.D`"
+                    f"Invalid ty-map at {file.path}:{code.lineno_start}; "
+                    "expected exactly `A.B -> C.D`"
                 ) from e
-            ty_map[lhs.strip()] = rhs.strip()
+            lhs = lhs.strip()
+            rhs = rhs.strip()
+            if not lhs or not rhs:
+                raise ValueError(
+                    f"Invalid ty-map at {file.path}:{code.lineno_start}; "
+                    "both sides of `->` must be non-empty"
+                )
+
+            previous = pending.get(lhs) or definitions.get(lhs)
+            if previous is not None and previous[0] != rhs:
+                previous_rhs, previous_path, previous_line = previous
+                raise ValueError(
+                    f"Conflicting ty-map for {lhs!r} at {file.path}:{code.lineno_start}: "
+                    f"{rhs!r}; first defined as {previous_rhs!r} at "
+                    f"{previous_path}:{previous_line}"
+                )
+            pending.setdefault(lhs, (rhs, file.path, code.lineno_start))
+
+    for lhs, definition in pending.items():
+        rhs, _, _ = definition
+        ty_map[lhs] = rhs
+        definitions.setdefault(lhs, definition)
 
 
 def _stage_2(
@@ -247,7 +370,7 @@ def _stage_2(
     generator: Generator,
 ) -> set[str]:
     def _find_or_insert_file(path: Path) -> FileInfo:
-        # Search the in-memory transaction first. In particular, Rust uses the
+        # Search the in-memory render plan first. In particular, Rust uses the
         # same ``mod.rs`` as both API and init file, and previously staged files
         # do not exist on disk yet.
         resolved = path.resolve()
@@ -288,16 +411,13 @@ def _stage_2(
     } | C.BUILTIN_TYPE_KEYS
 
     # Step 0. Generate missing `_ffi_api.py` and `__init__.py` under each prefix.
-    prefix_filter = init_cfg.prefix.strip()
-    if prefix_filter and not prefix_filter.endswith("."):
-        prefix_filter += "."
-    root_prefix = prefix_filter.rstrip(".")
-    prefixes: dict[str, list[str]] = collect_type_keys((), {root_prefix})
+    roots = set(init_cfg.normalized_prefixes())
+    prefixes: dict[str, list[str]] = collect_type_keys((), roots)
     for prefix in global_funcs:
         prefixes.setdefault(prefix, [])
     generated_prefixes: set[str] = set()
     for prefix, obj_names in prefixes.items():
-        if not (prefix == root_prefix or prefix.startswith(prefix_filter)):
+        if not any(prefix == root or prefix.startswith(f"{root}.") for root in roots):
             continue
         funcs = sorted(
             [] if prefix in defined_func_prefixes else global_funcs.get(prefix, []),
@@ -306,6 +426,8 @@ def _stage_2(
         objs = sorted(set(obj_names) - defined_objs)
         object_infos = toposort_objects(objs)
         if not funcs and not object_infos:
+            if obj_names or global_funcs.get(prefix):
+                generated_prefixes.add(prefix)
             continue
         generated_prefixes.add(prefix)
         # Step 1. Compute the target path. Directories/files are committed only
@@ -321,7 +443,7 @@ def _stage_2(
             prefix,
             object_infos,
             init_cfg,
-            is_root=prefix == root_prefix,
+            is_root=prefix in roots,
         )
         _append_in_memory(target_file, api_append)
         # Step 3. Generate the package entry (Python `__init__.py`; re-exports the
@@ -340,10 +462,33 @@ def _stage_3(  # noqa: PLR0912
     ty_map: dict[str, str],
     global_funcs: dict[str, list[FuncInfo]],
     generator: Generator,
+    known_type_keys: set[str] | None = None,
+    local_type_keys: set[str] | None = None,
+    canonical_type_keys: set[str] | None = None,
+    module_segments: tuple[str, ...] | None = None,
 ) -> None:
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
-    imports = generator.new_imports()
+    if known_type_keys is None:
+        known_type_keys = {
+            code.param
+            for code in file.code_blocks
+            if code.kind == "object" and isinstance(code.param, str)
+        }
+    if local_type_keys is None:
+        local_type_keys = {
+            code.param
+            for code in file.code_blocks
+            if code.kind == "object" and isinstance(code.param, str)
+        }
+    if canonical_type_keys is None:
+        canonical_type_keys = local_type_keys
+    imports = generator.new_imports(
+        known_type_keys,
+        local_type_keys=local_type_keys,
+        canonical_type_keys=canonical_type_keys,
+        module_segments=module_segments,
+    )
     # Stage 1. Collect `tvm-ffi-stubgen(import-object): ...`
     for code in file.code_blocks:
         if code.kind == "import-object":
@@ -380,6 +525,7 @@ def _stage_3(  # noqa: PLR0912
     for code in file.code_blocks:
         if code.kind == "export":
             generator.generate_export_block(code)
+    file.generated_items = generator.generated_item_names(imports)
 
 
 def _parse_args() -> Options:
@@ -395,8 +541,8 @@ def _parse_args() -> Options:
         prog="tvm-ffi-stubgen",
         description=(
             "Generate type stubs for TVM FFI extensions. It supports two modes\n"
-            "- In `--init-*` mode, it generates missing `_ffi_api.py` and `__init__.py` files, "
-            "based on the registered global functions and object types in the loaded libraries.\n"
+            "- With `--init-prefix`, it scaffolds missing target-language modules from the "
+            "registered global functions and object types in the loaded libraries.\n"
             "- In normal mode, it processes the given files/directories in-place, generating "
             "type stubs inside special `tvm-ffi-stubgen` directive blocks.\n\n"
             f"Documentation: {C.TERM_CYAN}{C.DOC_URL}{C.TERM_RESET}."
@@ -431,7 +577,7 @@ def _parse_args() -> Options:
         default="",
         help=(
             "Python package name to generate stubs for (e.g. apache-tvm-ffi). "
-            "Required together with --init-lib and --init-prefix."
+            "Python target only; required together with --init-lib and --init-prefix."
         ),
     )
     parser.add_argument(
@@ -440,17 +586,19 @@ def _parse_args() -> Options:
         default="",
         help=(
             "CMake target that produces the shared library to load for stub generation "
-            "(e.g. tvm_ffi_shared). Required together with --init-pypkg and "
-            "--init-prefix."
+            "(e.g. tvm_ffi_shared). Python target only; required together with "
+            "--init-pypkg and --init-prefix."
         ),
     )
     parser.add_argument(
         "--init-prefix",
         type=str,
-        default="",
+        action="append",
+        default=[],
         help=(
             "Global function/object prefix to include when generating stubs "
-            "(e.g. tvm_ffi.). Required together with --init-pypkg and --init-lib."
+            "(e.g. tvm_ffi.). Repeat this flag to generate multiple roots in one invocation. "
+            "For Rust this is the only init option required."
         ),
     )
     parser.add_argument(
@@ -497,15 +645,19 @@ def _parse_args() -> Options:
     )
     args = parser.parse_args()
 
-    init_flags = [args.init_pypkg, args.init_lib, args.init_prefix]
     init_cfg: InitConfig | None = None
-    if any(init_flags):
-        if not all(init_flags):
+    if args.target == "rust":
+        if args.init_pypkg or args.init_lib:
+            parser.error("--init-pypkg and --init-lib are only valid with --target python")
+        if args.init_prefix:
+            init_cfg = InitConfig(pkg="", shared_target="", prefixes=tuple(args.init_prefix))
+    elif args.init_pypkg or args.init_lib or args.init_prefix:
+        if not args.init_pypkg or not args.init_lib or not args.init_prefix:
             parser.error("--init-pypkg, --init-lib, and --init-prefix must be provided together")
         init_cfg = InitConfig(
             pkg=args.init_pypkg,
             shared_target=args.init_lib,
-            prefix=args.init_prefix,
+            prefixes=tuple(args.init_prefix),
         )
 
     if not args.files:

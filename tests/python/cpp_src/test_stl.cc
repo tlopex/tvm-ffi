@@ -85,8 +85,8 @@ auto test_map_2(const std::unordered_map<std::string, int>& map)
   return result;
 }
 
-auto test_function(std::function<int(void)> f) -> std::function<int(void)> {
-  return [fn = std::move(f)] { return fn() + 1; };
+auto test_function(std::function<int(int)> f) -> std::function<int(int)> {
+  return [fn = std::move(f)](int value) { return fn(value) + 1; };
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(test_tuple, test_tuple)

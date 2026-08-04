@@ -76,8 +76,15 @@ class Generator(Protocol):
 
     # --- import collection (representation is generator-private) ------------
 
-    def new_imports(self) -> Any:
-        """Create a fresh, empty import collector for one file."""
+    def new_imports(
+        self,
+        known_type_keys: set[str],
+        *,
+        local_type_keys: set[str],
+        canonical_type_keys: set[str],
+        module_segments: tuple[str, ...] | None,
+    ) -> Any:
+        """Create an import collector with the current file's object locations."""
         ...
 
     def add_imported_object(
@@ -97,6 +104,10 @@ class Generator(Protocol):
 
     def extra_export_names(self, imports: Any) -> set[str]:
         """Return extra public-export names implied by the collected imports."""
+        ...
+
+    def generated_item_names(self, imports: Any) -> set[str]:
+        """Return target-namespace items emitted in the current file."""
         ...
 
     # --- per-block generation (mutates `code.lines`) ------------------------
@@ -141,10 +152,6 @@ class Generator(Protocol):
         """Emit a submodule re-export for an ``export/<submodule>`` block."""
         ...
 
-    def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
-        """Emit shared per-file support code for generator-specific helper blocks."""
-        ...
-
     # --- whole-file scaffolding (used by `--init` mode) ---------------------
 
     def api_filename(self) -> str:
@@ -173,12 +180,14 @@ class Generator(Protocol):
         """Return text appended to a freshly scaffolded package entry (Python ``__init__.py``)."""
         ...
 
-    def validate_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """Validate language-specific tree finalization without writing files."""
-        ...
-
-    def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """Post-``--init`` hook to stitch the generated tree after file creation."""
+    def plan_init(
+        self,
+        init_path: Path,
+        generated_prefixes: set[str],
+        overlay: dict[Path, str],
+        generated_items: dict[Path, set[str]],
+    ) -> dict[Path, str]:
+        """Plan language-specific tree wiring against staged file contents."""
         ...
 
 

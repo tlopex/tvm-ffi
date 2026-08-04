@@ -93,8 +93,20 @@ class InitConfig:
     - Windows: {shared_target}.dll
     """
 
-    prefix: str
-    """Only generate stubs for global function and objects with the given prefix, e.g. `tvm_ffi.`"""
+    prefixes: tuple[str, ...]
+    """Generate globals and objects under these reflection roots."""
+
+    def normalized_prefixes(self) -> tuple[str, ...]:
+        """Return unique dotted roots, accepting one optional trailing dot."""
+        roots: set[str] = set()
+        for prefix in self.prefixes:
+            root = prefix.strip()
+            if root.endswith("."):
+                root = root[:-1]
+            if not root or any(not part for part in root.split(".")):
+                raise ValueError(f"--init-prefix must contain non-empty dotted parts: {prefix!r}")
+            roots.add(root)
+        return tuple(sorted(roots))
 
 
 @dataclasses.dataclass

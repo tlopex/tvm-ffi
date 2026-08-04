@@ -50,8 +50,16 @@ class PythonGenerator:
 
     # --- import collection (Python representation is private) ---------------
 
-    def new_imports(self) -> PythonImports:
+    def new_imports(
+        self,
+        known_type_keys: set[str],
+        *,
+        local_type_keys: set[str],
+        canonical_type_keys: set[str],
+        module_segments: tuple[str, ...] | None,
+    ) -> PythonImports:
         """Create an empty import collector."""
+        _ = (known_type_keys, local_type_keys, canonical_type_keys, module_segments)
         return PythonImports()
 
     def add_imported_object(
@@ -70,6 +78,11 @@ class PythonGenerator:
     def extra_export_names(self, imports: PythonImports) -> set[str]:
         """Return extra ``__all__`` names implied by the collected imports."""
         return {"LIB"} if imports.has_lib_load else set()
+
+    def generated_item_names(self, imports: PythonImports) -> set[str]:
+        """Python package wiring has no shared Rust-style type namespace."""
+        _ = imports
+        return set()
 
     # --- per-block generation (mutates `code.lines`) ------------------------
 
@@ -118,9 +131,6 @@ class PythonGenerator:
         """Emit a Python submodule re-export for an ``export/<submodule>`` block."""
         G.generate_python_export(code)
 
-    def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
-        """No-op: Python needs no per-file support code (Python files have no helpers block)."""
-
     # --- whole-file scaffolding (used by `--init` mode) ---------------------
 
     def api_filename(self) -> str:
@@ -151,8 +161,13 @@ class PythonGenerator:
         """Return text appended to a scaffolded ``__init__.py``."""
         return G.generate_python_init(code_blocks, module_name, submodule, self.syntax)
 
-    def validate_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """No-op: Python packages need no parent-declares-child wiring."""
-
-    def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """No-op: Python packages need no parent-declares-child wiring."""
+    def plan_init(
+        self,
+        init_path: Path,
+        generated_prefixes: set[str],
+        overlay: dict[Path, str],
+        generated_items: dict[Path, set[str]],
+    ) -> dict[Path, str]:
+        """Python packages need no parent-declares-child wiring."""
+        _ = (init_path, generated_prefixes, overlay, generated_items)
+        return {}

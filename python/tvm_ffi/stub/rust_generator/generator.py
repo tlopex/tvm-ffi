@@ -26,15 +26,14 @@ from typing import TYPE_CHECKING
 
 from .. import consts as C
 from .codegen import (
-    finalize_rust_module_tree,
     generate_rust_api_file,
     generate_rust_global_funcs,
     generate_rust_import_section,
     generate_rust_object,
-    validate_rust_module_tree,
+    plan_rust_module_tree,
 )
 from .consts import RUST_TY_MAP_DEFAULTS
-from .utils import RustImports, RustUse
+from .utils import RustImports, RustUse, generated_rust_type_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -47,10 +46,10 @@ class RustGenerator:
     """Generator that emits Rust binding stubs.
 
     Generated object nodes are opaque prefix markers. Field reads, reflected
-    methods, and explicitly registered constructors delegate to the loaded
-    runtime, so Rust never mirrors or allocates a complete C++ object layout. Schemas without a native
-    Rust sum/container representation remain available through type-erased
-    ``Any`` carriers rather than being silently omitted.
+    methods, and explicitly reflected constructors delegate to the loaded runtime,
+    so Rust never mirrors or allocates a complete C++ object layout. Schemas
+    without a native Rust sum/container representation remain available through
+    type-erased ``Any`` carriers rather than being silently omitted.
     """
 
     name = "rust"
@@ -60,27 +59,44 @@ class RustGenerator:
         """Return the default FFI-origin -> Rust-type name map."""
         return RUST_TY_MAP_DEFAULTS.copy()
 
-    def new_imports(self) -> RustImports:
+    def new_imports(
+        self,
+        known_type_keys: set[str],
+        *,
+        local_type_keys: set[str],
+        canonical_type_keys: set[str],
+        module_segments: tuple[str, ...] | None,
+    ) -> RustImports:
         """Create an empty Rust ``use`` collector."""
-        return RustImports()
+        return RustImports(
+            known_type_keys=known_type_keys,
+            local_type_keys=local_type_keys,
+            canonical_type_keys=canonical_type_keys,
+            module_segments=module_segments,
+        )
 
     def add_imported_object(
         self, imports: RustImports, name: str, type_checking_only: str, alias: str
     ) -> None:
         """Record an ``import-object`` directive as a ``use``.
 
-        ``type_checking_only`` and ``alias`` are ignored (Rust has no
-        ``TYPE_CHECKING`` split and the Rust backend never emits ``use .. as``).
+        Rust has no ``TYPE_CHECKING`` split, but preserves an explicit alias as
+        ``use <path> as <alias>``.
         """
-        imports.record(name)
+        _ = type_checking_only
+        imports.record(name, alias or None)
 
     def canonical_type_name(self, type_key: str) -> str:
         """Return the Rust path for a defined type key (matches :attr:`RustUse.path`)."""
-        return RustUse(type_key).path
+        return RustUse(generated_rust_type_path(type_key)).path
 
     def extra_export_names(self, imports: RustImports) -> set[str]:
         """No extra export names for Rust."""
         return set()
+
+    def generated_item_names(self, imports: RustImports) -> set[str]:
+        """Return items occupying Rust's module type namespace."""
+        return set(imports.local_items)
 
     def generate_global_funcs_block(
         self,
@@ -116,10 +132,6 @@ class RustGenerator:
     def generate_export_block(self, code: CodeBlock) -> None:
         """No-op for now: submodule re-export is not generated."""
 
-    def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
-        """Rust currently emits support code next to each generated object."""
-        _ = (code, opt)
-
     def api_filename(self) -> str:
         """One Rust file per module prefix."""
         return "mod.rs"
@@ -154,10 +166,17 @@ class RustGenerator:
         """No-op: Rust has no separate package-entry file (the API file IS the module)."""
         return ""
 
-    def validate_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """Fail closed on malformed module-tree markers without writing files."""
-        validate_rust_module_tree(init_path, generated_prefixes)
-
-    def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """Auto-form the module tree: write ``pub mod <child>;`` declarations."""
-        finalize_rust_module_tree(init_path, generated_prefixes)
+    def plan_init(
+        self,
+        init_path: Path,
+        generated_prefixes: set[str],
+        overlay: dict[Path, str],
+        generated_items: dict[Path, set[str]],
+    ) -> dict[Path, str]:
+        """Plan ``pub mod <child>;`` wiring against staged generated files."""
+        return plan_rust_module_tree(
+            init_path,
+            generated_prefixes,
+            overlay,
+            generated_items,
+        )

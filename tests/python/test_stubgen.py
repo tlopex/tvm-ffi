@@ -788,7 +788,7 @@ def test_generate_import_section_no_imports_noop() -> None:
     assert code.lines == before
 
 
-def test_generate_all_builds_sorted_and_deduped_list() -> None:
+def test_generate_all_sorts_export_basenames() -> None:
     code = CodeBlock(
         kind="global",
         param="all",
@@ -798,7 +798,7 @@ def test_generate_all_builds_sorted_and_deduped_list() -> None:
     )
     generate_python_all(
         code,
-        names={"tvm_ffi.foo", "bar", "pkg.baz", "bar"},  # duplicates stripped
+        names={"tvm_ffi.foo", "bar", "pkg.baz"},
         opt=Options(indent=2),
     )
     assert code.lines == [
@@ -845,7 +845,7 @@ def test_generate_all_uses_isort_style_ordering() -> None:
     ]
 
 
-def test_stage_3_adds_LIB_when_load_lib_imported(tmp_path: Path) -> None:
+def test_stage_3_exports_loaded_library_and_generated_function(tmp_path: Path) -> None:
     path = tmp_path / "demo.py"
     global_block = CodeBlock(
         kind="global",
@@ -891,8 +891,12 @@ def test_stage_3_adds_LIB_when_load_lib_imported(tmp_path: Path) -> None:
         {"testing": funcs},
         get_generator("python"),
     )
-    lib_lines = [line for line in all_block.lines if "LIB" in line]
-    assert any("LIB" in line for line in lib_lines)
+    assert all_block.lines == [
+        f"{C.PYTHON_SYNTAX.begin} __all__",
+        '"LIB",',
+        '"add_one",',
+        C.PYTHON_SYNTAX.end,
+    ]
 
 
 def test_generate_export_builds_all_extension() -> None:
@@ -932,7 +936,7 @@ def test_generate_init_with_and_without_existing_export_block() -> None:
 
 
 def test_generate_ffi_api_without_objects_includes_sections() -> None:
-    init_cfg = InitConfig(pkg="pkg", shared_target="pkg_shared", prefix="pkg.")
+    init_cfg = InitConfig(pkg="pkg", shared_target="pkg_shared", prefixes=("pkg.",))
     code = generate_python_ffi_api(
         [],
         _default_ty_map(),
@@ -949,7 +953,7 @@ def test_generate_ffi_api_without_objects_includes_sections() -> None:
 
 
 def test_generate_ffi_api_with_objects_imports_parents() -> None:
-    init_cfg = InitConfig(pkg="pkg", shared_target="pkg_shared", prefix="pkg.")
+    init_cfg = InitConfig(pkg="pkg", shared_target="pkg_shared", prefixes=("pkg.",))
     obj_info = ObjectInfo(
         fields=[],
         methods=[],
@@ -1006,7 +1010,7 @@ def test_stage_2_filters_prefix_and_marks_root(
     generated = _stage_2(
         files=files,
         ty_map=_default_ty_map(),
-        init_cfg=InitConfig(pkg="demo-pkg", shared_target="demo_shared", prefix="demo."),
+        init_cfg=InitConfig(pkg="demo-pkg", shared_target="demo_shared", prefixes=("demo.",)),
         init_path=tmp_path,
         global_funcs=global_funcs,
         generator=get_generator("python"),

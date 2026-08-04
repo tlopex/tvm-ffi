@@ -52,6 +52,25 @@ def write_text_atomic(path: Path, text: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def print_text_diff(path: Path, before: tuple[str, ...], after: tuple[str, ...]) -> None:
+    """Print one colorized unified diff without mutating either snapshot."""
+    print(f"{C.TERM_CYAN}[File] {path}{C.TERM_RESET}")
+    if before == after:
+        print(f"{C.TERM_CYAN}-----> Unchanged{C.TERM_RESET}")
+        return
+    for line in difflib.unified_diff(before, after, lineterm=""):
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("-"):
+            print(f"{C.TERM_RED}{line}{C.TERM_RESET}")
+        elif line.startswith("+"):
+            print(f"{C.TERM_GREEN}{line}{C.TERM_RESET}")
+        elif line.startswith("?"):
+            print(f"{C.TERM_YELLOW}{line}{C.TERM_RESET}")
+        else:
+            print(line)
+
+
 def syntax_for(path: Path) -> C.MarkerSyntax:
     """Pick the comment-marker syntax for a file based on its extension."""
     return C.SYNTAX_BY_EXT.get(path.suffix.lower(), C.PYTHON_SYNTAX)
@@ -153,31 +172,15 @@ class FileInfo:
     lines: tuple[str, ...]
     code_blocks: list[CodeBlock]
     syntax: C.MarkerSyntax
+    generated_items: set[str] = dataclasses.field(default_factory=set)
 
-    def update(self, verbose: bool, dry_run: bool) -> bool:
-        """Update the file's lines based on the current code blocks and optionally show a diff."""
-        new_lines = tuple(line for block in self.code_blocks for line in block.lines)
-        if self.lines == new_lines:
-            if verbose:
-                print(f"{C.TERM_CYAN}-----> Unchanged{C.TERM_RESET}")
-            return False
-        if verbose:
-            for line in difflib.unified_diff(self.lines, new_lines, lineterm=""):
-                # Skip placeholder headers when fromfile/tofile are unspecified
-                if line.startswith("---") or line.startswith("+++"):
-                    continue
-                if line.startswith("-") and not line.startswith("---"):
-                    print(f"{C.TERM_RED}{line}{C.TERM_RESET}")  # Red for removals
-                elif line.startswith("+") and not line.startswith("+++"):
-                    print(f"{C.TERM_GREEN}{line}{C.TERM_RESET}")  # Green for additions
-                elif line.startswith("?"):
-                    print(f"{C.TERM_YELLOW}{line}{C.TERM_RESET}")  # Yellow for hints
-                else:
-                    print(line)
-        self.lines = new_lines
-        if not dry_run:
-            write_text_atomic(self.path, "\n".join(self.lines) + "\n")
-        return True
+    def rendered_lines(self) -> tuple[str, ...]:
+        """Return the current code-block rendering."""
+        return tuple(line for block in self.code_blocks for line in block.lines)
+
+    def rendered_text(self) -> str:
+        """Return the current code-block rendering as a newline-terminated file."""
+        return "\n".join(self.rendered_lines()) + "\n"
 
     @staticmethod
     def from_file(
@@ -270,12 +273,6 @@ class FileInfo:
             raise ValueError("Unclosed stub block at end of file")
         return FileInfo(path=file, lines=tuple(lines), code_blocks=codes, syntax=syntax)
 
-    def reload(self) -> None:
-        """Reload the code blocks from disk while preserving original `lines`."""
-        source = FileInfo.from_file(self.path, syntax=self.syntax)
-        assert source is not None, f"File no longer exists or valid: {self.path}"
-        self.code_blocks = source.code_blocks
-
 
 def collect_files(paths: list[Path]) -> list[FileInfo]:
     """Collect requested files, propagating every walk and parse failure."""
@@ -301,8 +298,8 @@ def collect_files(paths: list[Path]) -> list[FileInfo]:
     def _path_sort_key(path: Path) -> str:
         return str(path)
 
-    filenames = list(_walk_recursive())
-    filenames = sorted(filenames, key=_path_sort_key)
+    filenames = {file.resolve(): file.resolve() for file in _walk_recursive()}
+    filenames = sorted(filenames.values(), key=_path_sort_key)
     files = []
     for file in filenames:
         content = FileInfo.from_file(file)

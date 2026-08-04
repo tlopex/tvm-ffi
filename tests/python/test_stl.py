@@ -18,6 +18,7 @@ import pathlib
 
 import pytest
 import tvm_ffi.cpp
+from tvm_ffi.core import TypeSchema
 from tvm_ffi.module import Module
 
 
@@ -26,6 +27,7 @@ def test_stl() -> None:
     output_lib_path = tvm_ffi.cpp.build(
         name="test_stl",
         sources=[str(cpp_path)],
+        extra_cflags=["-DTVM_FFI_DLL_EXPORT_INCLUDE_METADATA=1"],
     )
 
     mod: Module = tvm_ffi.load_module(output_lib_path)
@@ -38,13 +40,22 @@ def test_stl() -> None:
     assert list(mod.test_variant([1, 1.0])) == ["int", "float"]
     assert dict(mod.test_map({"a": 1, "b": 2})) == {1: "a", 2: "b"}
     assert dict(mod.test_map_2({"a": 1, "b": 2})) == {1: "a", 2: "b"}
-    assert mod.test_function(lambda: 0)() == 1
-    assert mod.test_function(lambda: 10)() == 11
+    assert mod.test_function(lambda value: value)(10) == 11
+
+    metadata = mod.get_function_metadata("test_function")
+    assert metadata is not None
+    schema = TypeSchema.from_json_str(metadata["type_schema"])
+    assert schema.repr() == "Callable[[Callable[[int], int]], Callable[[int], int]]"
+
+    vector_metadata = mod.get_function_metadata("test_vector")
+    assert vector_metadata is not None
+    vector_schema = TypeSchema.from_json_str(vector_metadata["type_schema"])
+    assert vector_schema.repr() == "Callable[[Array[Array[int]] | None], Array[int] | None]"
 
     with pytest.raises(TypeError):
         mod.test_tuple([1.5, 2.5])
     with pytest.raises(TypeError):
-        mod.test_function(lambda: 0)(100)
+        mod.test_function(lambda value: value)()
 
 
 if __name__ == "__main__":

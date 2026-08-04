@@ -34,6 +34,7 @@ RUST_TY_MAP_DEFAULTS = {
     "Array": "tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
     "Map": "tvm_ffi::Map",  # the crate's own Map<K, V>, NOT HashMap
     "TypedExpr": "tvm_ffi::TypedExpr",
+    "Optional": "std::option::Option",
     # A generic/opaque object VALUE is the single-pointer `ObjectRef` handle
     # (AnyCompatible, niche-optimizable), NOT the 24-byte `Object` data struct
     # (which is only ever the embedded struct `base`, spelled literally by codegen).
@@ -60,6 +61,25 @@ RUST_TY_MAP_DEFAULTS = {
 #: typed container.  This is fail-safe and preserves every value without
 #: pretending that a Python ``Union`` or FFI tuple has Rust's native layout.
 RUST_TYPE_ERASED_ORIGINS = frozenset({"Dict", "List", "Union", "tuple"})
+
+# Origins whose default Rust carrier implements ObjectRefCore. Generated
+# object keys are handled separately from this explicit runtime list.
+RUST_OBJECT_REF_ORIGINS = frozenset(
+    {
+        "Array",
+        "Callable",
+        "Map",
+        "Object",
+        "Shape",
+        "Tensor",
+        "ffi.Error",
+        "ffi.Function",
+        "ffi.Module",
+        "ffi.Object",
+        "ffi.Shape",
+        "ffi.Tensor",
+    }
+)
 
 #: Module-prefix rewrites for ``use`` paths: builtin ``ffi.*`` type keys live at
 #: the crate root.

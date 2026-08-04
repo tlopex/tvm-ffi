@@ -3488,9 +3488,10 @@ class TestSTLOriginParsing:
     def test_std_function(self) -> None:
         """std::function maps to Callable."""
         s = TypeSchema.from_json_str(
-            '{"type":"std::function","args":[{"type":"int"},{"type":"str"}]}'
+            '{"type":"std::function","args":[{"type":"int"},[{"type":"str"}]]}'
         )
         assert s.origin == "Callable"
+        assert [arg.origin for arg in s.args] == ["int", "str"]
 
     def test_object_rvalue_ref_origin(self) -> None:
         """ObjectRValueRef maps to Object."""
@@ -3777,15 +3778,20 @@ class TestUnionValueProtocol:
 # Category 68: from_json_obj robustness
 # ---------------------------------------------------------------------------
 class TestFromJsonObjRobustness:
-    """from_json_obj handles non-dict args and malformed input."""
+    """from_json_obj rejects metadata it cannot preserve semantically."""
 
-    def test_non_dict_args_skipped(self) -> None:
-        """Non-dict elements in args list are silently skipped."""
-        obj = {"type": "std::vector", "args": [{"type": "int"}, 42]}
-        s = TypeSchema.from_json_obj(obj)
-        assert s.origin == "Array"
-        assert len(s.args) == 1
-        assert s.args[0].origin == "int"
+    def test_std_array_maps_to_array_carrier(self) -> None:
+        """The native converter owns the extent check; bindings retain the element type."""
+        obj = {"type": "std::array", "args": [{"type": "int"}, 42]}
+        schema = TypeSchema.from_json_obj(obj)
+        assert schema.origin == "Array"
+        assert [arg.origin for arg in schema.args] == ["int"]
+
+    @pytest.mark.parametrize("extent", [0, -1, True, "42", None])
+    def test_std_array_rejects_invalid_extent(self, extent: object) -> None:
+        obj = {"type": "std::array", "args": [{"type": "int"}, extent]}
+        with pytest.raises(TypeError, match="positive_integer_extent"):
+            TypeSchema.from_json_obj(obj)
 
     def test_malformed_input_raises_type_error(self) -> None:
         """Non-dict top-level raises TypeError, not AssertionError."""
@@ -3893,19 +3899,15 @@ class TestObjectConvertiblePrecedence:
 # Category 71: from_json_obj non-iterable args
 # ---------------------------------------------------------------------------
 class TestFromJsonObjNonIterableArgs:
-    """from_json_obj handles non-iterable args values gracefully."""
+    """from_json_obj rejects malformed args containers."""
 
-    def test_non_iterable_args_treated_as_empty(self) -> None:
-        """Non-list/tuple args value (e.g., int) treated as empty args."""
-        s = TypeSchema.from_json_obj({"type": "int", "args": 42})
-        assert s.origin == "int"
-        assert s.args == ()
+    def test_non_iterable_args_rejected(self) -> None:
+        with pytest.raises(TypeError, match=r"\$\.args: expected a JSON array"):
+            TypeSchema.from_json_obj({"type": "int", "args": 42})
 
-    def test_string_args_treated_as_empty(self) -> None:
-        """String args value treated as empty (not iterated char-by-char)."""
-        s = TypeSchema.from_json_obj({"type": "int", "args": "bad"})
-        assert s.origin == "int"
-        assert s.args == ()
+    def test_string_args_rejected(self) -> None:
+        with pytest.raises(TypeError, match=r"\$\.args: expected a JSON array"):
+            TypeSchema.from_json_obj({"type": "int", "args": "bad"})
 
 
 # ---------------------------------------------------------------------------

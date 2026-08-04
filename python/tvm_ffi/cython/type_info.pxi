@@ -105,6 +105,7 @@ _TYPE_SCHEMA_ORIGIN_CONVERTER = {
     "DataType": "dtype",
     # C++ STL types (emitted by TypeTraits in include/tvm/ffi/extra/stl.h)
     "std::vector": "Array",
+    "std::array": "Array",
     "std::optional": "Optional",
     "std::variant": "Union",
     "std::tuple": "tuple",
@@ -268,23 +269,60 @@ class TypeSchema:
     def from_json_obj(obj: dict[str, Any]) -> "TypeSchema":
         """Construct a :class:`TypeSchema` from a parsed JSON object.
 
-        Non-dict elements in the ``"args"`` list (e.g., numeric lengths
-        emitted by ``std::array`` TypeTraits) are silently skipped.
+        Malformed or currently unrepresentable argument shapes fail with their
+        JSON path; metadata must never be silently discarded.
         """
+        return TypeSchema._from_json_obj_at(obj, "$")
+
+    @staticmethod
+    def _from_json_obj_at(obj: dict[str, Any], path: str) -> "TypeSchema":
         if not isinstance(obj, dict) or "type" not in obj:
             raise TypeError(
-                f"expected schema dict with 'type' key, got {type(obj).__name__}"
+                f"{path}: expected schema dict with 'type' key, got {type(obj).__name__}"
             )
-        origin = obj["type"]
-        origin = _TYPE_SCHEMA_ORIGIN_CONVERTER.get(origin, origin)
+        raw_origin = obj["type"]
+        if not isinstance(raw_origin, str):
+            raise TypeError(f"{path}.type: expected str, got {type(raw_origin).__name__}")
+        origin = _TYPE_SCHEMA_ORIGIN_CONVERTER.get(raw_origin, raw_origin)
         if "args" not in obj:
             return TypeSchema(origin)
         raw_args = obj["args"]
         if not isinstance(raw_args, (list, tuple)):
-            raw_args = ()
+            raise TypeError(
+                f"{path}.args: expected a JSON array, got {type(raw_args).__name__}"
+            )
+
+        if raw_origin == "std::function":
+            if len(raw_args) != 2 or not isinstance(raw_args[1], (list, tuple)):
+                raise TypeError(
+                    f"{path}.args: std::function requires [return_schema, [parameter_schemas]]"
+                )
+            ret = TypeSchema._from_json_obj_at(raw_args[0], f"{path}.args[0]")
+            params = tuple(
+                TypeSchema._from_json_obj_at(arg, f"{path}.args[1][{index}]")
+                for index, arg in enumerate(raw_args[1])
+            )
+            return TypeSchema(origin, (ret, *params))
+
+        if raw_origin == "std::array":
+            if (
+                len(raw_args) != 2
+                or not isinstance(raw_args[1], int)
+                or isinstance(raw_args[1], bool)
+                or raw_args[1] <= 0
+            ):
+                raise TypeError(
+                    f"{path}.args: std::array requires [element_schema, positive_integer_extent]"
+                )
+            # The packed carrier is ffi.Array.  The fixed extent is enforced by
+            # the native TypeTraits conversion, while TypeSchema describes the
+            # element carrier used by Python/Rust bindings.
+            element = TypeSchema._from_json_obj_at(raw_args[0], f"{path}.args[0]")
+            return TypeSchema(origin, (element,))
+
         args = tuple(
-            TypeSchema.from_json_obj(a) for a in raw_args
-            if isinstance(a, dict)
+            TypeSchema._from_json_obj_at(arg, f"{path}.args[{index}]")
+            for index, arg in enumerate(raw_args)
         )
         return TypeSchema(origin, args)
 

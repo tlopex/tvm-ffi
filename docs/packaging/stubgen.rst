@@ -208,13 +208,28 @@ To update only existing directives (equivalent to ``STUB_INIT OFF``), omit the `
      python/my_ffi_extension                \
      --dlls build/libmy_ffi_extension.so
 
+For Rust, select the Rust backend and repeat ``--init-prefix`` for every
+dependency root that belongs in the generated module tree:
+
+.. code-block:: bash
+
+   tvm-ffi-stubgen rust/src/generated       \
+     --target rust                          \
+     --dlls build/libmy_ffi_extension.so    \
+     --init-prefix ir.                      \
+     --init-prefix transform.
+
+The Rust backend emits opaque owning object handles, reflection-backed field
+getters, and wrappers for reflected functions. It does not copy native object
+layouts or invent constructors that are absent from reflection metadata.
+
 Command Line Options
 ~~~~~~~~~~~~~~~~~~~~
 
 **Required arguments:**
 
 ``<directory>`` (positional)
-   Directory to generate/update Python stubs. Corresponds to ``STUB_DIR``.
+   Directory to generate/update target-language stubs. Corresponds to ``STUB_DIR``.
 
 ``--dlls``
    Shared libraries to load during generation. The stub generator loads these DLLs to
@@ -224,20 +239,27 @@ Command Line Options
 
 **Arguments for full generation** (corresponds to ``STUB_INIT ON``):
 
-All three are required together. When omitted, the tool operates in directive-only mode
-(equivalent to ``STUB_INIT OFF``).
+For Python, all three options below are required together. For Rust,
+``--init-prefix`` alone enables full generation and may be repeated. When
+omitted, the tool operates in directive-only mode (equivalent to
+``STUB_INIT OFF``).
 
 ``--init-pypkg``
-   Python package name. Corresponds to ``STUB_PKG``.
+   Python package name. Python target only; corresponds to ``STUB_PKG``.
 
 ``--init-lib``
-   CMake target name. Used as the second argument in the generated
+   Python-target CMake target name. Used as the second argument in the generated
    ``load_lib_module("<STUB_PKG>", "<init-lib>")`` call.
 
 ``--init-prefix``
-   Registry prefix filter. Corresponds to ``STUB_PREFIX``.
+   Registry prefix filter. Repeat the option to generate several roots in one
+   dependency-closed invocation. Corresponds to ``STUB_PREFIX`` for the
+   single-prefix CMake interface.
 
 **Optional arguments:**
+
+``--target``
+   Output language. Supported values are ``python`` (default) and ``rust``.
 
 ``--verbose``
    Print a unified diff of changes to each file.
