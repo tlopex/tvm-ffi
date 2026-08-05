@@ -285,6 +285,30 @@ def test_constructor_requires_an_explicit_reflected_initializer() -> None:
     assert 'from_type_method_cached(&F, NodeObj::type_index(), "__ffi_init__")' in source
 
 
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        FuncInfo.from_schema("__ffi_init__", TypeSchema("Callable"), is_member=False),
+        FuncInfo.from_schema(
+            "__ffi_init__",
+            TypeSchema("Callable", (TypeSchema("test.Node"),)),
+            is_member=True,
+        ),
+    ],
+)
+def test_invalid_reflected_constructor_fails_closed(constructor: FuncInfo) -> None:
+    info = ObjectInfo(
+        fields=[],
+        methods=[constructor],
+        type_key="test.Node",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+
+    with pytest.raises(UnsupportedTypeError, match="typed static factory"):
+        _generate_object(info)
+
+
 def test_global_wrapper_is_typed_and_cached() -> None:
     block = _block("global", ("test.transform", ""))
     function = FuncInfo.from_schema(
@@ -428,7 +452,7 @@ def test_rust_api_scaffold_has_license() -> None:
         RUST_TY_MAP_DEFAULTS.copy(),
         "test",
         [],
-        InitConfig(pkg="test", shared_target="test", prefixes=("test",)),
+        InitConfig(pkg="", shared_target="", prefixes=("test",)),
         is_root=True,
         syntax=C.RUST_SYNTAX,
     )
@@ -442,7 +466,7 @@ def test_rust_api_scaffold_has_license() -> None:
     assert f"{C.RUST_SYNTAX.begin} global/test" in source
 
 
-def test_rust_cli_scaffolding_needs_only_reflection_prefixes(
+def test_rust_cli_parsing_needs_only_reflection_prefixes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -466,7 +490,7 @@ def test_rust_cli_scaffolding_needs_only_reflection_prefixes(
     assert options.init.normalized_prefixes() == ("ir", "tirx")
 
 
-def test_cli_multi_prefix_generation_is_cross_referenced_and_idempotent(
+def test_mocked_registry_multi_prefix_generation_is_cross_referenced_and_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     infos = {
@@ -486,7 +510,7 @@ def test_cli_multi_prefix_generation_is_cross_referenced_and_idempotent(
     options = Options(
         target="rust",
         files=[str(tmp_path)],
-        init=InitConfig(pkg="test", shared_target="test", prefixes=("beta", "alpha")),
+        init=InitConfig(pkg="", shared_target="", prefixes=("beta", "alpha")),
     )
 
     def collect_types(_exact: tuple[str, ...], recursive: set[str]) -> dict[str, list[str]]:

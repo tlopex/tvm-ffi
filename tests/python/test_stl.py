@@ -55,6 +55,8 @@ def test_stl() -> None:
     with pytest.raises(TypeError):
         mod.test_tuple([1.5, 2.5])
     with pytest.raises(TypeError):
+        mod.test_vector([[1]])
+    with pytest.raises(TypeError):
         mod.test_function(lambda value: value)()
 
 
