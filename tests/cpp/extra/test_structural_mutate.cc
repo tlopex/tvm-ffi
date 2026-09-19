@@ -262,6 +262,31 @@ TEST(StructuralMutate, UnchangedProtocolResolvesAtThrowingEntryPoints) {
                                    static_cast<int32_t>(order));
     EXPECT_EQ(unchanged.cast<int64_t>(), 1);
   }
+
+  // A post-order Unchanged preserves the result of child mapping, including copies.
+  for (bool shared : {false, true}) {
+    for (bool increment : {false, true}) {
+      Array<int64_t> root{1};
+      const Object* original = root.get();
+      Any retained = shared ? Any(root) : Any();
+      auto mapped = StructuralMap<WalkOrder::kPostOrder>(
+                        std::move(root),
+                        [&](int64_t value) -> UnchangedOr<int64_t> {
+                          if (increment) return value + 1;
+                          return Unchanged();
+                        },
+                        [&](const Array<int64_t>& value) -> UnchangedOr<Any> {
+                          EXPECT_EQ(value[0], increment ? 2 : 1);
+                          return Unchanged();
+                        })
+                        .cast<Array<int64_t>>();
+      EXPECT_EQ(mapped[0], increment ? 2 : 1);
+      EXPECT_EQ(mapped.get() == original, !shared || !increment);
+      if (shared) {
+        EXPECT_EQ(retained.cast<Array<int64_t>>()[0], 1);
+      }
+    }
+  }
 }
 
 class TNestedMapHookObj : public Object {
@@ -1000,6 +1025,10 @@ void CheckContainerCallbackErrorsStayExpected() {
     ASSERT_TRUE(result.is_err());
     EXPECT_EQ(result.error().kind(), "ValueError");
     EXPECT_EQ(result.error().message(), expected_message);
+    auto context = VisitErrorContext::TryGetFromError(result.error());
+    ASSERT_TRUE(context.has_value());
+    EXPECT_EQ(VisitErrorContext::FindAccessPaths(root.cast<ObjectRef>(), context.value()).size(),
+              1u);
   };
   auto raise = [](const TVar&) -> Expected<Any> { throw Error("ValueError", "raised", ""); };
   auto returns_error = [](const TVar&) -> Expected<Any> {
@@ -1026,6 +1055,34 @@ void CheckContainerCallbackErrorsStayExpected() {
 TEST(StructuralMap, ContainerCallbackErrorsStayExpected) {
   CheckContainerCallbackErrorsStayExpected<WalkOrder::kPreOrder>();
   CheckContainerCallbackErrorsStayExpected<WalkOrder::kPostOrder>();
+
+  // Error annotation must keep the copied post-order input alive, even for borrowed callbacks.
+  Array<int64_t> root{1};
+  auto fail_after_descent = [](AnyView value) -> Expected<Any> {
+    if (value.type_index() == TypeIndex::kTVMFFIInt) return value.cast<int64_t>() + 1;
+    return Unexpected(Error("ValueError", "post-order failure", ""));
+  };
+  Function callback =
+      Function::FromTyped([&](AnyView value) { return fail_after_descent(value).value(); });
+  Array<Tuple<int32_t, Function>> callbacks{
+      Tuple<int32_t, Function>(TypeIndex::kTVMFFIInt, callback),
+      Tuple<int32_t, Function>(TypeIndex::kTVMFFIArray, callback)};
+  for (bool dynamic : {false, true}) {
+    auto result = dynamic
+                      ? Function::GetGlobalRequired("ffi.StructuralMap")
+                            .CallExpected<Any>(root, callbacks, Array<Tuple<int32_t, Function>>(),
+                                               static_cast<int32_t>(WalkOrder::kPostOrder))
+                      : StructuralMapExpected<WalkOrder::kPostOrder>(root, fail_after_descent);
+    ASSERT_TRUE(result.is_err());
+    EXPECT_EQ(result.error().message(), "post-order failure");
+    auto context = VisitErrorContext::TryGetFromError(result.error());
+    ASSERT_TRUE(context.has_value());
+    ASSERT_FALSE(context.value()->reverse_visit_pattern.empty());
+    auto failed = context.value()->reverse_visit_pattern[0].as_or_throw<Array<int64_t>>();
+    EXPECT_EQ(failed[0], 2);
+    EXPECT_FALSE(failed.same_as(root));
+    EXPECT_EQ(root[0], 1);
+  }
 }
 
 template <WalkOrder order>
@@ -1135,18 +1192,22 @@ Any CallDynStructuralMap(AnyView root, const Array<Tuple<int32_t, Function>>& ca
   return fn(root, callbacks, Array<Tuple<int32_t, Function>>(), static_cast<int32_t>(order));
 }
 
-TEST(StructuralMapDyn, PreOrderDescendsOriginalAfterUnchangedCallback) {
+TEST(StructuralMapDyn, DescendsWithUnchangedCallback) {
   AnyArray root{int64_t{1}};
   Function unchanged = Function::FromTyped([](const AnyArray&) -> Any { return Unchanged(); });
   Function increment = Function::FromTyped([](int64_t value) -> Any { return Any(value + 1); });
 
-  AnyArray mapped =
-      CallDynStructuralMap(root,
-                           {Tuple<int32_t, Function>(TypeIndex::kTVMFFIArray, unchanged),
-                            Tuple<int32_t, Function>(TypeIndex::kTVMFFIInt, increment)},
-                           WalkOrder::kPreOrder)
-          .cast<AnyArray>();
-  EXPECT_EQ(mapped[0].cast<int64_t>(), 2);
+  for (WalkOrder order : {WalkOrder::kPreOrder, WalkOrder::kPostOrder}) {
+    AnyArray mapped =
+        CallDynStructuralMap(root,
+                             {Tuple<int32_t, Function>(TypeIndex::kTVMFFIArray, unchanged),
+                              Tuple<int32_t, Function>(TypeIndex::kTVMFFIInt, increment)},
+                             order)
+            .cast<AnyArray>();
+    EXPECT_EQ(mapped[0].cast<int64_t>(), 2);
+    EXPECT_FALSE(mapped.same_as(root));
+    EXPECT_EQ(root[0].cast<int64_t>(), 1);
+  }
 }
 
 TEST(StructuralMapDyn, InvokesCallbackForEveryFreeVarOccurrence) {
